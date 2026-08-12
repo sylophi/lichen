@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Checked via the API so no git credentials are ever persisted into
+      # the checkout that later runs the signing steps.
+      - name: Ensure release tag is on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          STATUS=$(gh api "repos/${{ github.repository }}/compare/main...${{ github.sha }}" --jq .status)
+          if [ "$STATUS" != "identical" ] && [ "$STATUS" != "behind" ]; then
+            echo "Release tag must point to a commit on main (got: $STATUS)."
+            exit 1
+          fi
+
+      # The tag is stamped into the binary via -ldflags, so keep the
+      # format uniform.
+      - name: Ensure tag is semver
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$TAG' is not vX.Y.Z."
+            exit 1
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build darwin targets
+        run: |
+          mkdir -p dist
+          for combo in darwin-arm64 darwin-x64; do
+            arch=${combo#*-}
+            goarch=$arch
+            [ "$arch" = "x64" ] && goarch=amd64
+            CGO_ENABLED=0 GOOS=darwin GOARCH=$goarch \
+              go build -trimpath \
+                -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+                -o dist/lichen-${combo} .
+          done
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_SIGNING_IDENTITY" || -z "$BUILD_CERTIFICATE_BASE64" || -z "$P12_PASSWORD" || -z "$KEYCHAIN_PASSWORD" ]]; then
+            echo "Missing signing secrets. Set APPLE_SIGNING_IDENTITY, BUILD_CERTIFICATE_BASE64, P12_PASSWORD, and KEYCHAIN_PASSWORD."
+            exit 1
+          fi
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Sign
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          for bin in dist/lichen-*; do
+            codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+              --identifier dev.lichen --options runtime --timestamp "$bin"
+            codesign --verify --strict --verbose=2 "$bin"
+          done
+
+      # Bare executables cannot be stapled, so Gatekeeper fetches the
+      # ticket online when it ever needs to assess one. curl downloads
+      # carry no quarantine flag anyway: notarization here is about
+      # browser downloads and about Apple knowing the binary.
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -z "$APPLE_ID" || -z "$APPLE_APP_SPECIFIC_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "Missing notarization secrets. Set APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID."
+            exit 1
+          fi
+          for bin in dist/lichen-*; do
+            ditto -c -k "$bin" "$bin.zip"
+            xcrun notarytool submit "$bin.zip" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+            rm "$bin.zip"
+          done
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/lichen-*
