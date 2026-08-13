@@ -89,12 +89,13 @@ func usage() {
   lichen start | stop | restart    control the background daemon
   lichen update                    self-update to the latest release
   lichen uninstall [--yes]         remove lichen, keep your files
-  lichen daemon                    run in foreground (launchd's entry point)
   lichen version                   print the installed version
 
 aliases: rm = remove, ls = list
 setup: install.sh   teardown: uninstall.sh (or lichen uninstall)
 `)
+	// `lichen daemon` is deliberately absent: it's launchd's entry point
+	// (see install.sh's plist), not a command users run themselves.
 }
 
 func clilog() *log.Logger { return log.New(os.Stdout, "", 0) }
