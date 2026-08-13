@@ -24,17 +24,3 @@ Then start syncing things:
 ```sh
 lichen sync ~/.zshrc ~/.claude/CLAUDE.md
 ```
-
-## CLI
-
-```
-lichen sync <path...>     start syncing files
-lichen sync               pull and apply everything now
-lichen remove <path...>   stop syncing (local copies stay)
-lichen list               show every synced file
-
-lichen status [--secrets] | logs
-lichen start | stop | restart | update | uninstall
-
-aliases: rm = remove, ls = list
-```
