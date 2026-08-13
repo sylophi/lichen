@@ -12,6 +12,10 @@ lichen is a pun on 'liken' and just how lichen behaves in general.
 
 ## Setup
 
+Prereqs on each machine: [Homebrew](https://brew.sh) (installs chezmoi),
+and git access that can clone the sync repo (SSH key or credentials,
+since the repo should be private).
+
 Create an empty private repo once (the sync repo, e.g. `you/lichen-sync`),
 then on every machine:
 
