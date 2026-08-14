@@ -20,7 +20,7 @@ Create an empty private repo once (the sync repo, e.g. `you/lichen-sync`),
 then on every machine:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sylophi/lichen/HEAD/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dittofleet/lichen/HEAD/install.sh | sh
 ```
 
 Then start syncing things:

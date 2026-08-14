@@ -20,7 +20,7 @@ else
     x86_64) ARCH=x64 ;;
     *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
   esac
-  URL="https://github.com/sylophi/lichen/releases/latest/download/lichen-darwin-$ARCH"
+  URL="https://github.com/dittofleet/lichen/releases/latest/download/lichen-darwin-$ARCH"
   TMP=$(mktemp)
   trap 'rm -f "$TMP"' EXIT
   echo "Downloading $URL..." >&2

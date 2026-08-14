@@ -341,7 +341,7 @@ func cmdDaemonCtl(action string) error {
 	return nil
 }
 
-const releaseRepo = "sylophi/lichen"
+const releaseRepo = "dittofleet/lichen"
 
 // httpGet fetches url, treating any non-200 as an error. The timeout
 // covers the whole exchange, body read included. Callers close the body.
