@@ -140,15 +140,11 @@ func dim(s string) string  { return paint("2", s) }
 // cmdSync with paths starts managing them. With none it runs a full pass:
 // pull, capture local edits, apply.
 func cmdSync(paths []string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		// A deleted config is the one Load failure a sync can fix itself.
-		files.RestoreConfig(clilog())
-		if cfg, err = config.Load(); err != nil {
-			return err
-		}
-	}
 	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
+	if err != nil {
+		return err
+	}
 	if len(paths) == 0 {
 		if err := files.Reconcile(cfg, lg); err != nil {
 			return err
@@ -167,11 +163,12 @@ func cmdRemove(paths []string) error {
 	if len(paths) == 0 {
 		return fmt.Errorf("usage: lichen remove <path...>")
 	}
-	cfg, err := config.Load()
+	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
 	if err != nil {
 		return err
 	}
-	if err := files.Remove(cfg, clilog(), paths); err != nil {
+	if err := files.Remove(cfg, lg, paths); err != nil {
 		return err
 	}
 	fmt.Printf("stopped syncing: %s (local copies left in place)\n", strings.Join(paths, ", "))
@@ -182,11 +179,12 @@ func cmdRecover(paths []string) error {
 	if len(paths) == 0 {
 		return fmt.Errorf("usage: lichen recover <path...>")
 	}
-	cfg, err := config.Load()
+	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
 	if err != nil {
 		return err
 	}
-	recovered, err := files.Recover(cfg, clilog(), paths)
+	recovered, err := files.Recover(cfg, lg, paths)
 	if err != nil {
 		return err
 	}
@@ -194,11 +192,7 @@ func cmdRecover(paths []string) error {
 		fmt.Println("nothing to recover")
 		return nil
 	}
-	shown := make([]string, len(recovered))
-	for i, p := range recovered {
-		shown[i] = config.ContractHome(p)
-	}
-	fmt.Printf("recovered: %s\n", strings.Join(shown, ", "))
+	fmt.Printf("recovered: %s\n", strings.Join(recovered, ", "))
 	return nil
 }
 

@@ -14,7 +14,6 @@ package files
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -29,6 +28,8 @@ import (
 	"lichen/internal/gitutil"
 )
 
+// Host and At are for humans reading the log file; no code depends on
+// them.
 type deletionEntry struct {
 	Source string `json:"source"` // repo-relative source path at deletion time
 	Host   string `json:"host"`
@@ -57,11 +58,21 @@ func loadDeletionLog(src string) (map[string]deletionEntry, error) {
 }
 
 func saveDeletionLog(src string, m map[string]deletionEntry) error {
-	data, err := json.MarshalIndent(m, "", "  ")
+	return writeJSON(deletionLogPath(src), m)
+}
+
+func writeJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(deletionLogPath(src), append(data, '\n'), 0o644)
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+// atOrUnder reports whether p IS root or lies inside it. The trailing
+// separator keeps ~/.zshrc.bak from matching ~/.zshrc.
+func atOrUnder(p, root string) bool {
+	return p == root || strings.HasPrefix(p, root+"/")
 }
 
 // pruneDeletionLog drops recorded deletions that overlap paths, in either
@@ -78,7 +89,7 @@ func pruneDeletionLog(src string, absPaths []string) error {
 	for _, abs := range absPaths {
 		t := config.ContractHome(abs)
 		for key := range dlog {
-			if key == t || strings.HasPrefix(key, t+"/") || strings.HasPrefix(t, key+"/") {
+			if atOrUnder(key, t) || atOrUnder(t, key) {
 				delete(dlog, key)
 				changed = true
 			}
@@ -100,7 +111,7 @@ func manifestPath() (string, error) {
 	return filepath.Join(d, "managed.json"), nil
 }
 
-// ok=false (absent or unreadable) means no baseline yet: nothing can
+// ok=false (absent or unreadable) means no baseline: nothing can
 // depart, so no deletion can fire. Unreadable deliberately degrades the
 // same way, it is the direction that deletes nothing.
 func loadManifest() ([]string, bool, error) {
@@ -119,11 +130,7 @@ func loadManifest() ([]string, bool, error) {
 	return paths, true, nil
 }
 
-func saveManifest(prev []string, hadPrev bool, current []string) error {
-	cur := slices.Sorted(slices.Values(current))
-	if hadPrev && slices.Equal(slices.Sorted(slices.Values(prev)), cur) {
-		return nil
-	}
+func saveManifest(paths []string) error {
 	p, err := manifestPath()
 	if err != nil {
 		return err
@@ -131,11 +138,7 @@ func saveManifest(prev []string, hadPrev bool, current []string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cur, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(p, append(data, '\n'), 0o644)
+	return writeJSON(p, slices.Sorted(slices.Values(paths)))
 }
 
 // dropNested returns sorted paths minus any that sit under another listed
@@ -145,7 +148,7 @@ func dropNested(paths []string) []string {
 	slices.Sort(sorted)
 	var out []string
 	for _, p := range sorted {
-		if len(out) > 0 && (p == out[len(out)-1] || strings.HasPrefix(p, out[len(out)-1]+"/")) {
+		if len(out) > 0 && atOrUnder(p, out[len(out)-1]) {
 			continue
 		}
 		out = append(out, p)
@@ -160,16 +163,16 @@ func dropNested(paths []string) []string {
 // there reads as a local deletion on a later pass. Best-effort: a stale
 // entry only weakens that backup, it breaks nothing.
 func dropEntryStateUnder(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
 	all, err := entryStatePaths()
 	if err != nil {
 		return
 	}
 	for key := range all {
-		for _, p := range paths {
-			if key == p || strings.HasPrefix(key, p+"/") {
-				chezmoi("state", "delete", "--bucket=entryState", "--key="+key)
-				break
-			}
+		if slices.ContainsFunc(paths, func(p string) bool { return atOrUnder(key, p) }) {
+			chezmoi("state", "delete", "--bucket=entryState", "--key="+key)
 		}
 	}
 }
@@ -177,25 +180,25 @@ func dropEntryStateUnder(paths []string) {
 // topMissing climbs from a missing file to the top-most missing managed
 // ancestor: a deleted directory arrives from the watcher as its files,
 // but the whole subtree should propagate as one deletion.
-func topMissing(abs string) string {
+func topMissing(abs string, managedDirs map[string]bool) string {
 	for {
 		parent := filepath.Dir(abs)
-		if _, err := os.Lstat(parent); err == nil {
+		if !managedDirs[parent] {
 			return abs
 		}
-		if _, err := chezmoi("source-path", parent); err != nil {
+		if _, err := os.Lstat(parent); err == nil {
 			return abs
 		}
 		abs = parent
 	}
 }
 
-// PropagateDeletions handles synced paths deleted locally: forget them,
+// propagateDeletions handles synced paths deleted locally: forget them,
 // record them on the deletion log, and push, so every other machine
 // deletes its copy too. The one exception is lichen's own config, the
 // keystone every machine needs to run at all: that one is restored.
-func PropagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) error {
-	if !Active() {
+func propagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) error {
+	if len(paths) == 0 || !Active() {
 		return nil
 	}
 	src, err := SourcePath()
@@ -206,21 +209,32 @@ func PropagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) erro
 	if err != nil {
 		return err
 	}
-	climbed := make([]string, 0, len(paths))
+	var missing []string
 	for _, abs := range paths {
-		if _, err := os.Lstat(abs); err == nil {
-			continue // reappeared since it was seen missing: not a deletion
+		if _, err := os.Lstat(abs); err != nil { // else reappeared: not a deletion
+			missing = append(missing, abs)
 		}
-		climbed = append(climbed, topMissing(abs))
 	}
+	if len(missing) == 0 {
+		return nil
+	}
+	managedDirs, err := managedDirSet()
+	if err != nil {
+		return err
+	}
+	for i, abs := range missing {
+		missing[i] = topMissing(abs, managedDirs)
+	}
+	dlog, err := loadDeletionLog(src)
+	if err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	at := time.Now().UTC().Format(time.RFC3339)
 	var doomed []string
-	sources := map[string]string{}
-	for _, abs := range dropNested(climbed) {
+	for _, abs := range dropNested(missing) {
 		if abs == cfgPath {
-			lg.Printf("files: restoring %s (lichen cannot run without its config, so its deletion never propagates)", abs)
-			if _, err := chezmoi("apply", "--force", abs); err != nil {
-				lg.Printf("files: restore: %v", err)
-			}
+			restoreConfig(lg)
 			continue
 		}
 		sp, err := chezmoi("source-path", abs)
@@ -231,20 +245,11 @@ func PropagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) erro
 		if err != nil || strings.HasPrefix(rel, "..") {
 			continue
 		}
+		dlog[config.ContractHome(abs)] = deletionEntry{Source: rel, Host: host, At: at}
 		doomed = append(doomed, abs)
-		sources[abs] = rel
 	}
 	if len(doomed) == 0 {
 		return nil
-	}
-	dlog, err := loadDeletionLog(src)
-	if err != nil {
-		return err
-	}
-	host, _ := os.Hostname()
-	at := time.Now().UTC().Format(time.RFC3339)
-	for _, abs := range doomed {
-		dlog[config.ContractHome(abs)] = deletionEntry{Source: sources[abs], Host: host, At: at}
 	}
 	if err := saveDeletionLog(src, dlog); err != nil {
 		return err
@@ -258,13 +263,37 @@ func PropagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) erro
 	return commitPush(cfg, subject, body, lg)
 }
 
+// handleMissing routes classify's missing-file bucket. Only a path this
+// machine saw on its previous pass can be a LOCAL deletion to propagate:
+// a managed-but-missing path absent from that baseline is arriving from
+// another machine (a recover, or stale chezmoi state), so it is applied
+// rather than bounced back at the fleet as a deletion. The baseline is
+// threaded in from applyIncomingDeletions because by now the manifest on
+// disk already describes THIS pass.
+func handleMissing(cfg *config.Config, lg *log.Logger, prevManaged map[string]bool, deleted []string) error {
+	var mine, incoming []string
+	for _, p := range deleted {
+		if inManifest(prevManaged, p) {
+			mine = append(mine, p)
+		} else {
+			incoming = append(incoming, p)
+		}
+	}
+	if len(incoming) > 0 {
+		lg.Printf("files: applying incoming file(s): %v", incoming)
+		if _, err := chezmoi(append([]string{"apply", "--force"}, incoming...)...); err != nil {
+			lg.Printf("files: apply: %v", err)
+		}
+	}
+	return propagateDeletions(cfg, lg, mine)
+}
+
 // applyIncomingDeletions carries out deletions other machines pushed:
 // every path that left the managed set since the last pass AND is on the
 // deletion log gets its local copy moved to backups. Departures without a
 // log entry (`lichen remove`, an ignore rule) keep their local copy. The
 // first pass on a machine only records the baseline. Returns the previous
-// pass's managed set (nil without a baseline) so the caller can tell a
-// file this machine once saw from one that is newly arriving.
+// pass's managed set (nil without a baseline) for handleMissing.
 func applyIncomingDeletions(lg *log.Logger) (map[string]bool, error) {
 	src, err := SourcePath()
 	if err != nil {
@@ -278,29 +307,53 @@ func applyIncomingDeletions(lg *log.Logger) (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	var prevSet map[string]bool
-	if ok {
-		prevSet = map[string]bool{}
-		for _, p := range prev {
-			prevSet[p] = true
-		}
-		curSet := map[string]bool{}
-		for _, p := range current {
-			curSet[p] = true
-		}
-		var departed []string
-		for _, p := range prev {
-			if !curSet[p] {
-				departed = append(departed, p)
-			}
-		}
-		if len(departed) > 0 {
-			if err := deleteDeparted(src, departed, lg); err != nil {
-				return nil, err
-			}
+	if !ok {
+		return nil, saveManifest(current)
+	}
+	curSet := toSet(current)
+	var departed []string
+	for _, p := range prev {
+		if !curSet[p] {
+			departed = append(departed, p)
 		}
 	}
-	return prevSet, saveManifest(prev, ok, current)
+	if len(departed) > 0 {
+		if err := deleteDeparted(src, departed, lg); err != nil {
+			return nil, err
+		}
+	}
+	return toSet(prev), saveManifest(current)
+}
+
+func deleteDeparted(src string, departed []string, lg *log.Logger) error {
+	dlog, err := loadDeletionLog(src)
+	if err != nil || len(dlog) == 0 {
+		return err
+	}
+	var matched []string
+	for _, target := range slices.Sorted(maps.Keys(dlog)) {
+		abs, err := config.ExpandHome(target)
+		if err != nil {
+			continue
+		}
+		// A log entry for a directory is matched by the departure of any
+		// managed file that lived under it.
+		if !slices.ContainsFunc(departed, func(d string) bool { return atOrUnder(d, abs) }) {
+			continue
+		}
+		matched = append(matched, abs)
+		if _, err := os.Lstat(abs); err != nil {
+			continue // already gone here
+		}
+		to, err := backup.Move(abs)
+		if err != nil {
+			lg.Printf("files: deleting %s: %v", abs, err)
+			continue
+		}
+		lg.Printf("files: deleted %s (kept at %s; `lichen recover` re-syncs it)", abs, to)
+	}
+	dropEntryStateUnder(matched)
+	return nil
 }
 
 // addToManifest records freshly synced or recovered paths (for a
@@ -316,79 +369,38 @@ func addToManifest(absPaths []string) error {
 	if err != nil {
 		return err
 	}
-	set := map[string]bool{}
-	for _, p := range prev {
-		set[p] = true
-	}
+	set := toSet(prev)
 	added := false
 	for _, m := range current {
 		if set[m] {
 			continue
 		}
-		for _, p := range absPaths {
-			if m == p || strings.HasPrefix(m, p+"/") {
-				set[m] = true
-				added = true
-				break
-			}
+		if slices.ContainsFunc(absPaths, func(p string) bool { return atOrUnder(m, p) }) {
+			set[m] = true
+			added = true
 		}
 	}
 	if !added {
 		return nil
 	}
-	return saveManifest(nil, false, slices.Collect(maps.Keys(set)))
+	return saveManifest(slices.Collect(maps.Keys(set)))
 }
 
 // inManifest reports whether p, or any managed file under it (for a
 // directory), was part of the machine's previous pass.
 func inManifest(m map[string]bool, p string) bool {
-	if m[p] {
-		return true
-	}
 	for f := range m {
-		if strings.HasPrefix(f, p+"/") {
+		if atOrUnder(f, p) {
 			return true
 		}
 	}
 	return false
 }
 
-func deleteDeparted(src string, departed []string, lg *log.Logger) error {
-	dlog, err := loadDeletionLog(src)
-	if err != nil || len(dlog) == 0 {
-		return err
-	}
-	for _, target := range slices.Sorted(maps.Keys(dlog)) {
-		abs, err := config.ExpandHome(target)
-		if err != nil {
-			continue
-		}
-		// A log entry for a directory is matched by the departure of any
-		// managed file that lived under it.
-		hit := slices.ContainsFunc(departed, func(d string) bool {
-			return d == abs || strings.HasPrefix(d, abs+"/")
-		})
-		if !hit {
-			continue
-		}
-		dropEntryStateUnder([]string{abs})
-		if _, err := os.Lstat(abs); err != nil {
-			continue // already gone here
-		}
-		to, err := backup.Move(abs)
-		if err != nil {
-			lg.Printf("files: deleting %s: %v", abs, err)
-			continue
-		}
-		lg.Printf("files: deleted %s (kept at %s; `lichen recover` re-syncs it)", abs, to)
-	}
-	return nil
-}
-
 // Recover brings back files that were deleted everywhere: the last
 // version is lifted out of the sync repo's git history, synced again, and
 // applied, here and (through the push) on every other machine. Returns
-// the paths it brought back.
+// the paths it brought back, in ~/ form.
 func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, error) {
 	if !Active() {
 		return nil, fmt.Errorf("no sync repo initialized")
@@ -397,18 +409,15 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 	if err != nil {
 		return nil, err
 	}
-	abortStaleRebase(src, lg)
-	if Origin() != "" {
-		if _, err := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); err != nil {
-			abortStaleRebase(src, lg)
-			lg.Printf("files: pull: %v (recovering from the local clone's history)", err)
-		}
+	if err := pullRebase(src, lg); err != nil {
+		lg.Printf("files: pull: %v (recovering from the local clone's history)", err)
 	}
 	dlog, err := loadDeletionLog(src)
 	if err != nil {
 		return nil, err
 	}
 	var recovered []string
+	logChanged := false
 	for _, p := range paths {
 		abs, err := absPath(p)
 		if err != nil {
@@ -441,13 +450,16 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 			return nil, err
 		}
 		delete(dlog, key)
+		logChanged = true
 		recovered = append(recovered, abs)
 	}
 	if len(recovered) == 0 {
 		return nil, nil
 	}
-	if err := saveDeletionLog(src, dlog); err != nil {
-		return nil, err
+	if logChanged {
+		if err := saveDeletionLog(src, dlog); err != nil {
+			return nil, err
+		}
 	}
 	subject, body := commitMsg("recover", recovered)
 	if err := commitPush(cfg, subject, body, lg); err != nil {
@@ -459,43 +471,5 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 	if err := addToManifest(recovered); err != nil {
 		return nil, err
 	}
-	return recovered, nil
-}
-
-// RestoreConfig puts a deleted config.json back from the sync repo.
-// Without it no pass can run at all, so a missing config would otherwise
-// wedge this machine until a reinstall. Only an ABSENT file is restored:
-// an unparseable one may be mid-rewrite by a concurrent apply.
-func RestoreConfig(lg *log.Logger) {
-	if !Active() {
-		return
-	}
-	p, err := config.Path()
-	if err != nil {
-		return
-	}
-	if _, err := os.Stat(p); err == nil || !os.IsNotExist(err) {
-		return
-	}
-	if _, err := chezmoi("source-path", p); err != nil {
-		return
-	}
-	lg.Printf("files: config missing, restoring it from the sync repo")
-	if _, err := chezmoi("apply", "--force", p); err != nil {
-		lg.Printf("files: restore config: %v", err)
-	}
-}
-
-// LocalChange handles paths the watcher saw change: files still present
-// are captured with re-add, files now missing are deleted everywhere.
-func LocalChange(cfg *config.Config, lg *log.Logger, paths []string) error {
-	existing, missing := partitionExisting(paths)
-	var errs []error
-	if len(existing) > 0 {
-		errs = append(errs, ReAddPush(cfg, lg, existing))
-	}
-	if len(missing) > 0 {
-		errs = append(errs, PropagateDeletions(cfg, lg, missing))
-	}
-	return errors.Join(errs...)
+	return portablePaths(recovered), nil
 }

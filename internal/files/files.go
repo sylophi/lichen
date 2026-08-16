@@ -240,11 +240,16 @@ func managedDirSet() (map[string]bool, error) {
 	if err != nil {
 		return nil, err
 	}
+	return toSet(dirs), nil
+}
+
+// toSet turns a path list into a membership set.
+func toSet(paths []string) map[string]bool {
 	set := map[string]bool{}
-	for _, d := range dirs {
-		set[d] = true
+	for _, p := range paths {
+		set[p] = true
 	}
-	return set, nil
+	return set
 }
 
 // abortStaleRebase recovers a source repo left mid-rebase by a conflicted
@@ -260,6 +265,24 @@ func abortStaleRebase(src string, lg *log.Logger) {
 	}
 }
 
+// pullRebase pulls the sync repo under lichen's local-wins policy: rebase
+// (not ff-only) so a locally-committed-but-unpushed change doesn't wedge
+// the pull forever, with -X theirs preferring OUR replayed commits on
+// conflict (rebase swaps sides). A stale rebase is aborted before and
+// after, so a failed pull never leaves the repo wedged. No-op without an
+// origin.
+func pullRebase(src string, lg *log.Logger) error {
+	abortStaleRebase(src, lg)
+	if Origin() == "" {
+		return nil
+	}
+	if _, err := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); err != nil {
+		abortStaleRebase(src, lg)
+		return err
+	}
+	return nil
+}
+
 // Reconcile pulls the sync repo, captures local edits, and applies remote
 // changes. Backing up foreign files by MOVING them also means apply never
 // sees a modified destination, so it cannot prompt (the daemon runs with
@@ -272,16 +295,10 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	if err != nil {
 		return err
 	}
-	abortStaleRebase(src, lg)
+	if err := pullRebase(src, lg); err != nil {
+		lg.Printf("files: pull: %v (continuing with local state)", err)
+	}
 	if Origin() != "" {
-		// Rebase (not ff-only) so a locally-committed-but-unpushed change
-		// doesn't wedge the pull forever. -X theirs prefers OUR replayed
-		// commits on conflict (rebase swaps sides), matching lichen's
-		// local-wins policy.
-		if _, err := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); err != nil {
-			abortStaleRebase(src, lg)
-			lg.Printf("files: pull: %v (continuing with local state)", err)
-		}
 		// A rebase (or an earlier offline commit) can leave us ahead of
 		// origin with nothing new to stage. Push those commits now
 		// rather than waiting for the next local edit.
@@ -326,7 +343,7 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	editable, deleted := partitionExisting(localEdits)
 	if len(editable) > 0 {
 		lg.Printf("files: capturing local edits: %v", editable)
-		if err := ReAddPush(cfg, lg, editable); err != nil {
+		if err := reAddPush(cfg, lg, editable); err != nil {
 			return err
 		}
 		var still, skipped2 []string
@@ -348,27 +365,9 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		// machines move their copies to backups, and the content stays
 		// recoverable from the sync repo's history (`lichen recover`).
 		// `lichen remove` is the way to stop syncing while keeping every
-		// machine's copy. Only a path this machine saw on its previous
-		// pass can be a LOCAL deletion, though: a managed-but-missing
-		// path that was not in the last manifest is arriving from
-		// another machine (a recover, or stale chezmoi state), so it is
-		// applied rather than bounced back at the fleet as a deletion.
+		// machine's copy.
 		slices.Sort(deleted)
-		var mine, incoming []string
-		for _, p := range slices.Compact(deleted) {
-			if prevManaged != nil && inManifest(prevManaged, p) {
-				mine = append(mine, p)
-			} else {
-				incoming = append(incoming, p)
-			}
-		}
-		if len(incoming) > 0 {
-			lg.Printf("files: applying incoming file(s): %v", incoming)
-			if _, err := chezmoi(append([]string{"apply", "--force"}, incoming...)...); err != nil {
-				lg.Printf("files: apply: %v", err)
-			}
-		}
-		if err := PropagateDeletions(cfg, lg, mine); err != nil {
+		if err := handleMissing(cfg, lg, prevManaged, slices.Compact(deleted)); err != nil {
 			return err
 		}
 	}
@@ -398,6 +397,43 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	return nil
 }
 
+// LoadConfig loads lichen's config, first restoring a DELETED config
+// file from the sync repo: a machine without one could never run a pass
+// (including the healing one) again. Any other load failure, e.g. a file
+// mid-rewrite by a concurrent apply, stays an error. Callers must hold
+// the cross-process lock: the restore writes to the destination.
+func LoadConfig(lg *log.Logger) (*config.Config, error) {
+	cfg, err := config.Load()
+	if err == nil {
+		return cfg, nil
+	}
+	restoreConfig(lg)
+	return config.Load()
+}
+
+// restoreConfig puts a deleted config.json back from the sync repo. Only
+// an ABSENT file is restored: an unparseable one may be mid-rewrite by a
+// concurrent apply.
+func restoreConfig(lg *log.Logger) {
+	if !Active() {
+		return
+	}
+	p, err := config.Path()
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		return
+	}
+	if _, err := chezmoi("source-path", p); err != nil {
+		return
+	}
+	lg.Printf("files: config missing, restoring it from the sync repo")
+	if _, err := chezmoi("apply", "--force", p); err != nil {
+		lg.Printf("files: restore config: %v", err)
+	}
+}
+
 // ensureConfigManaged self-heals the keystone invariant: lichen's config
 // must be part of the sync repo. Covers first-machine bootstrap and the
 // config being forgotten later. Checked every pass: `chezmoi source-path
@@ -420,11 +456,11 @@ func ensureConfigManaged(cfg *config.Config, lg *log.Logger) error {
 	return commitPush(cfg, "manage config.json", "", lg)
 }
 
-// ReAddPush captures local edits to managed files back into the sync repo
+// reAddPush captures local edits to managed files back into the sync repo
 // and pushes. Template-sourced files are skipped by chezmoi itself
 // (re-add never overwrites templates), and the caller surfaces which paths
 // were dropped.
-func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
+func reAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return nil
 	}
@@ -435,6 +471,18 @@ func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 		lg.Printf("files: re-add: %s", out)
 	}
 	return commitPush(cfg, "file sync", "", lg)
+}
+
+// LocalChange handles paths the watcher saw change: files still present
+// are captured with re-add, files now missing are deleted everywhere
+// (see deletions.go).
+func LocalChange(cfg *config.Config, lg *log.Logger, paths []string) error {
+	existing, missing := partitionExisting(paths)
+	var readdErr error
+	if len(existing) > 0 {
+		readdErr = reAddPush(cfg, lg, existing)
+	}
+	return errors.Join(readdErr, propagateDeletions(cfg, lg, missing))
 }
 
 // Sync starts managing new paths (chezmoi add) and pushes. The pre-lichen
@@ -595,16 +643,12 @@ func commitPush(cfg *config.Config, subject, body string, lg *log.Logger) error 
 	}
 	if _, err := gitutil.Run(src, "push", "--quiet"); err != nil {
 		// A racing push from another machine or being offline is routine:
-		// try once behind a rebase (-X theirs keeps our replayed commits
-		// on conflict), abort any half-done rebase, else leave it for the
-		// next pass.
-		if _, perr := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); perr == nil {
+		// try once behind a rebase, else leave it for the next pass.
+		if pullRebase(src, lg) == nil {
 			if _, err2 := gitutil.Run(src, "push", "--quiet"); err2 == nil {
 				announce(cfg, lg)
 				return nil
 			}
-		} else {
-			abortStaleRebase(src, lg)
 		}
 		lg.Printf("files: push failed (will retry on next sync): %v", err)
 		return nil

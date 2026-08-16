@@ -72,16 +72,11 @@ func Run(version string) error {
 			return
 		}
 		defer release()
-		c, err := config.Load()
+		c, err := files.LoadConfig(lg)
 		if err != nil {
-			// A DELETED config gets restored from the sync repo (without
-			// one this machine could never pass here again); anything
-			// else may be mid-rewrite by an apply: skip this cycle.
-			files.RestoreConfig(lg)
-			if c, err = config.Load(); err != nil {
-				lg.Printf("config: %v", err)
-				return
-			}
+			// The config may be mid-rewrite by an apply: skip this cycle.
+			lg.Printf("config: %v", err)
+			return
 		}
 		fn(c)
 	}
@@ -232,9 +227,14 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 					lg.Printf("files: %v", err)
 				}
 			})
-			// A propagated deletion shrinks the managed set: stop
-			// watching what left it.
-			refresh()
+			// Only a propagated deletion shrinks the managed set; plain
+			// edits don't need the watch list rebuilt.
+			for _, p := range paths {
+				if _, err := os.Lstat(p); err != nil {
+					refresh()
+					break
+				}
+			}
 		}
 	}
 }
