@@ -2,7 +2,8 @@
 // machine. Three records make that safe. The deletion log in the sync
 // repo (.lichen-deleted.json, ignored by chezmoi, tracked by git) says
 // WHICH departures from the managed set are real deletions, as opposed to
-// `lichen remove`, which keeps local copies. Each machine's local
+// a path merely unmanaged (an ignore rule, a source file removed by
+// hand), which keeps local copies. Each machine's local
 // manifest of the managed set it saw last pass makes acting on a deletion
 // a one-shot transition, so a file recreated at the same path later is
 // never re-deleted. And chezmoi's entry state gates the sending side: a
@@ -312,7 +313,8 @@ func handleMissing(cfg *config.Config, lg *log.Logger, prev []string, deleted []
 // applyIncomingDeletions carries out deletions other machines pushed:
 // every path that left the managed set since the last pass AND is on the
 // deletion log gets its local copy moved to backups. Departures without a
-// log entry (`lichen remove`, an ignore rule) keep their local copy. The
+// log entry (an ignore rule, a hand-edit to the sync repo) keep their
+// local copy. The
 // first pass on a machine only records the baseline. Returns the previous
 // pass's managed files (nil without a baseline) for handleMissing.
 func applyIncomingDeletions(lg *log.Logger) ([]string, error) {

@@ -360,16 +360,15 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		uncaptured, deleted = partitionExisting(still)
 		if len(uncaptured) > 0 {
 			slices.Sort(uncaptured)
-			lg.Printf("files: NOT synced (template-sourced edit. Use `lichen remove` or edit the template in the sync repo): %v", slices.Compact(uncaptured))
+			lg.Printf("files: NOT synced (template-sourced edit, edit the template in the sync repo instead): %v", slices.Compact(uncaptured))
 		}
 	}
 	if len(deleted) > 0 {
 		// A locally deleted synced file is deleted everywhere: the other
 		// machines move their copies to backups, and the content stays
 		// recoverable from the sync repo's history (`lichen recover`).
-		// `lichen remove` is the way to stop syncing while keeping every
-		// machine's copy. A failure only defers the deletion to the next
-		// pass, so it must not block the applies below.
+		// A failure only defers the deletion to the next pass, so it
+		// must not block the applies below.
 		slices.Sort(deleted)
 		if err := handleMissing(cfg, lg, prevManaged, slices.Compact(deleted)); err != nil {
 			lg.Printf("files: deletions: %v (retrying next pass)", err)
@@ -555,40 +554,6 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 		return err
 	}
 	subject, body := commitMsg("sync", paths)
-	return commitPush(cfg, subject, body, lg)
-}
-
-// Remove stops managing paths. Local copies stay in place, on every
-// machine: without a deletion-log entry the other machines treat the
-// departure from the managed set as a forget, not a delete.
-func Remove(cfg *config.Config, lg *log.Logger, paths []string) error {
-	if !Active() {
-		return fmt.Errorf("no sync repo initialized")
-	}
-	src, err := SourcePath()
-	if err != nil {
-		return err
-	}
-	// Pull first for the same reason as Sync: the defensive prune below
-	// must see the latest deletion log.
-	if err := pullRebase(src, lg); err != nil {
-		lg.Printf("files: pull: %v (continuing with local state)", err)
-	}
-	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {
-		return err
-	}
-	// Defensive: a stale recorded deletion overlapping these paths would
-	// otherwise turn this forget into a delete on the other machines.
-	var absPaths []string
-	for _, p := range paths {
-		if abs, err := absPath(p); err == nil {
-			absPaths = append(absPaths, abs)
-		}
-	}
-	if err := pruneDeletionLog(src, absPaths); err != nil {
-		return err
-	}
-	subject, body := commitMsg("forget", paths)
 	return commitPush(cfg, subject, body, lg)
 }
 
