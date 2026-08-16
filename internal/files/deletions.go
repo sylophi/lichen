@@ -31,7 +31,7 @@ import (
 	"lichen/internal/gitutil"
 )
 
-// Host and At are for humans reading the log file; no code depends on
+// Host and At are for humans reading the log file. No code depends on
 // them.
 type deletionEntry struct {
 	Source string `json:"source"` // repo-relative source path at deletion time
@@ -397,7 +397,7 @@ func deleteDeparted(src string, departed []string, lg *log.Logger) error {
 					lg.Printf("files: deleting %s: %v", d, err)
 					continue
 				}
-				lg.Printf("files: deleted %s (kept at %s; `lichen recover` re-syncs it)", d, to)
+				lg.Printf("files: deleted %s (kept at %s, `lichen recover` re-syncs it)", d, to)
 			}
 			removeEmptyDirs(abs)
 			continue
@@ -407,7 +407,7 @@ func deleteDeparted(src string, departed []string, lg *log.Logger) error {
 			lg.Printf("files: deleting %s: %v", abs, err)
 			continue
 		}
-		lg.Printf("files: deleted %s (kept at %s; `lichen recover` re-syncs it)", abs, to)
+		lg.Printf("files: deleted %s (kept at %s, `lichen recover` re-syncs it)", abs, to)
 	}
 	dropEntryStateUnder(matched)
 	return nil
@@ -518,10 +518,10 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 		if !found {
 			for k := range dlog {
 				if atOrUnder(key, k) {
-					return nil, fmt.Errorf("%s was deleted as part of %s; run `lichen recover %s`", p, k, k)
+					return nil, fmt.Errorf("%s was deleted as part of %s: run `lichen recover %s`", p, k, k)
 				}
 			}
-			return nil, fmt.Errorf("%s has no recorded deletion; if it was ever synced, its history is still in the sync repo (git log)", p)
+			return nil, fmt.Errorf("%s has no recorded deletion (if it was ever synced, its history is still in the sync repo)", p)
 		}
 		// The last commit touching the source file is its deletion, so the
 		// commit before that holds the last content.

@@ -239,7 +239,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 					lg.Printf("files: %v", err)
 				}
 			})
-			// Only a propagated deletion shrinks the managed set; plain
+			// Only a propagated deletion shrinks the managed set. Plain
 			// edits don't need the watch list rebuilt.
 			if shrunk {
 				refresh()
