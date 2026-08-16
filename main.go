@@ -49,6 +49,8 @@ func main() {
 		err = withLock(func() error { return cmdSync(args[1:]) })
 	case "remove", "rm":
 		err = withLock(func() error { return cmdRemove(args[1:]) })
+	case "recover":
+		err = withLock(func() error { return cmdRecover(args[1:]) })
 	case "list", "ls":
 		err = cmdList()
 	case "logs":
@@ -81,6 +83,7 @@ func usage() {
   lichen sync <path...>            start syncing files across machines
   lichen sync                      pull and apply everything now
   lichen remove <path...>          stop syncing (local copies stay)
+  lichen recover <path...>         bring back files deleted everywhere
   lichen list                      show every synced file
 
   lichen status [--secrets]        daemon health and webhook setup
@@ -139,7 +142,11 @@ func dim(s string) string  { return paint("2", s) }
 func cmdSync(paths []string) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		// A deleted config is the one Load failure a sync can fix itself.
+		files.RestoreConfig(clilog())
+		if cfg, err = config.Load(); err != nil {
+			return err
+		}
 	}
 	lg := clilog()
 	if len(paths) == 0 {
@@ -168,6 +175,30 @@ func cmdRemove(paths []string) error {
 		return err
 	}
 	fmt.Printf("stopped syncing: %s (local copies left in place)\n", strings.Join(paths, ", "))
+	return nil
+}
+
+func cmdRecover(paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("usage: lichen recover <path...>")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	recovered, err := files.Recover(cfg, clilog(), paths)
+	if err != nil {
+		return err
+	}
+	if len(recovered) == 0 {
+		fmt.Println("nothing to recover")
+		return nil
+	}
+	shown := make([]string, len(recovered))
+	for i, p := range recovered {
+		shown[i] = config.ContractHome(p)
+	}
+	fmt.Printf("recovered: %s\n", strings.Join(shown, ", "))
 	return nil
 }
 

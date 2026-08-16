@@ -74,9 +74,14 @@ func Run(version string) error {
 		defer release()
 		c, err := config.Load()
 		if err != nil {
-			// The config may be mid-rewrite by an apply: skip this cycle.
-			lg.Printf("config: %v", err)
-			return
+			// A DELETED config gets restored from the sync repo (without
+			// one this machine could never pass here again); anything
+			// else may be mid-rewrite by an apply: skip this cycle.
+			files.RestoreConfig(lg)
+			if c, err = config.Load(); err != nil {
+				lg.Printf("config: %v", err)
+				return
+			}
 		}
 		fn(c)
 	}
@@ -158,6 +163,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 	defer w.Close()
 
 	managed := map[string]bool{}
+	watchedDirs := map[string]bool{}
 	refresh := func() {
 		if !files.Active() {
 			return
@@ -182,6 +188,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			w.Add(d) // errors (e.g. dir not created yet) are retried on next refresh
 		}
 		managed = nm
+		watchedDirs = dirs
 	}
 	refresh()
 
@@ -198,7 +205,11 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			if !ok {
 				return
 			}
-			if managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+			// A watched dir DISAPPEARING matters too: deleting a whole
+			// synced directory can surface as one Remove for the dir,
+			// with no per-file events (kqueue).
+			if managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 ||
+				watchedDirs[ev.Name] && ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
 				pending[ev.Name] = true
 				debounce.Reset(1500 * time.Millisecond)
 			}
@@ -216,11 +227,14 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			// runLocked provides the same mutex and cross-process lock
 			// sequence as every other mutating flow.
 			runLocked(func(c *config.Config) {
-				lg.Printf("files: local edit: %v", paths)
-				if err := files.ReAddPush(c, lg, paths); err != nil {
+				lg.Printf("files: local change: %v", paths)
+				if err := files.LocalChange(c, lg, paths); err != nil {
 					lg.Printf("files: %v", err)
 				}
 			})
+			// A propagated deletion shrinks the managed set: stop
+			// watching what left it.
+			refresh()
 		}
 	}
 }

@@ -1,6 +1,7 @@
 // Package files is lichen's sync engine: it wraps chezmoi, which owns the
 // hard parts (source state, templates, per-machine data), and adds WHEN it
 // runs. Local edits are captured by fsnotify-driven re-add and push,
+// local deletions propagate to every machine (deletions.go),
 // remote changes are pulled and applied on an event. The sync repo is
 // chezmoi's source repo. lichen's own config.json is managed inside it,
 // which is what carries a new machine's settings to it.
@@ -292,6 +293,12 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 			}
 		}
 	}
+	// Deletions other machines pushed are carried out before anything
+	// else looks at the destination state (see deletions.go).
+	prevManaged, err := applyIncomingDeletions(lg)
+	if err != nil {
+		return err
+	}
 	if err := ensureConfigManaged(cfg, lg); err != nil {
 		lg.Printf("files: %v", err)
 	}
@@ -337,15 +344,32 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		}
 	}
 	if len(deleted) > 0 {
-		// A locally deleted synced file is restored: a present file
-		// harms nothing, and `lichen remove` is the intentional way to
-		// stop syncing one. Restores need --force (chezmoi prompts on
-		// paths that changed since it last wrote them), which is safe
-		// here: the path is absent, nothing is clobbered.
+		// A locally deleted synced file is deleted everywhere: the other
+		// machines move their copies to backups, and the content stays
+		// recoverable from the sync repo's history (`lichen recover`).
+		// `lichen remove` is the way to stop syncing while keeping every
+		// machine's copy. Only a path this machine saw on its previous
+		// pass can be a LOCAL deletion, though: a managed-but-missing
+		// path that was not in the last manifest is arriving from
+		// another machine (a recover, or stale chezmoi state), so it is
+		// applied rather than bounced back at the fleet as a deletion.
 		slices.Sort(deleted)
-		lg.Printf("files: restoring locally deleted file(s) (use `lichen remove` to stop syncing): %v", deleted)
-		if _, err := chezmoi(append([]string{"apply", "--force"}, deleted...)...); err != nil {
-			lg.Printf("files: restore: %v", err)
+		var mine, incoming []string
+		for _, p := range slices.Compact(deleted) {
+			if prevManaged != nil && inManifest(prevManaged, p) {
+				mine = append(mine, p)
+			} else {
+				incoming = append(incoming, p)
+			}
+		}
+		if len(incoming) > 0 {
+			lg.Printf("files: applying incoming file(s): %v", incoming)
+			if _, err := chezmoi(append([]string{"apply", "--force"}, incoming...)...); err != nil {
+				lg.Printf("files: apply: %v", err)
+			}
+		}
+		if err := PropagateDeletions(cfg, lg, mine); err != nil {
+			return err
 		}
 	}
 	if len(skipped) > 0 {
@@ -424,6 +448,7 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized (re-run install.sh with LICHEN_REPO=<git url>)")
 	}
+	var absPaths []string
 	for _, p := range paths {
 		abs, err := absPath(p)
 		if err != nil {
@@ -435,6 +460,7 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 		if config.ContractHome(abs) == abs {
 			return fmt.Errorf("%s is outside the home directory, only files under ~ can be synced", p)
 		}
+		absPaths = append(absPaths, abs)
 		if _, err := os.Stat(abs); err != nil {
 			continue // chezmoi add will report the missing path
 		}
@@ -450,16 +476,45 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if _, err := chezmoi(append([]string{"add"}, paths...)...); err != nil {
 		return err
 	}
+	src, err := SourcePath()
+	if err != nil {
+		return err
+	}
+	// A path syncing (again) supersedes any recorded deletion of it: the
+	// prune rides along in the same commit.
+	if err := pruneDeletionLog(src, absPaths); err != nil {
+		return err
+	}
+	if err := addToManifest(absPaths); err != nil {
+		return err
+	}
 	subject, body := commitMsg("sync", paths)
 	return commitPush(cfg, subject, body, lg)
 }
 
-// Remove stops managing paths. Local copies stay in place.
+// Remove stops managing paths. Local copies stay in place, on every
+// machine: without a deletion-log entry the other machines treat the
+// departure from the managed set as a forget, not a delete.
 func Remove(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized")
 	}
 	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {
+		return err
+	}
+	src, err := SourcePath()
+	if err != nil {
+		return err
+	}
+	// Defensive: a stale recorded deletion overlapping these paths would
+	// otherwise turn this forget into a delete on the other machines.
+	var absPaths []string
+	for _, p := range paths {
+		if abs, err := absPath(p); err == nil {
+			absPaths = append(absPaths, abs)
+		}
+	}
+	if err := pruneDeletionLog(src, absPaths); err != nil {
 		return err
 	}
 	subject, body := commitMsg("forget", paths)
