@@ -38,7 +38,16 @@ func Run(version string) error {
 
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		// A missing config must heal HERE too, not only inside a pass:
+		// returning would make launchd's KeepAlive crash-loop the daemon
+		// without a pass ever running. The restore needs the lock.
+		if release, lerr := proclock.Acquire(ctx, nil); lerr == nil {
+			cfg, err = files.LoadConfig(lg)
+			release()
+		}
+		if err != nil {
+			return err
+		}
 	}
 	lg.Printf("lichen %s starting (server %s)", version, cfg.Server())
 	hostname, _ := os.Hostname()
@@ -221,19 +230,19 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			pending = map[string]bool{}
 			// runLocked provides the same mutex and cross-process lock
 			// sequence as every other mutating flow.
+			var shrunk bool
 			runLocked(func(c *config.Config) {
 				lg.Printf("files: local change: %v", paths)
-				if err := files.LocalChange(c, lg, paths); err != nil {
+				changed, err := files.LocalChange(c, lg, paths)
+				shrunk = changed
+				if err != nil {
 					lg.Printf("files: %v", err)
 				}
 			})
 			// Only a propagated deletion shrinks the managed set; plain
 			// edits don't need the watch list rebuilt.
-			for _, p := range paths {
-				if _, err := os.Lstat(p); err != nil {
-					refresh()
-					break
-				}
+			if shrunk {
+				refresh()
 			}
 		}
 	}

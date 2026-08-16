@@ -311,10 +311,13 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		}
 	}
 	// Deletions other machines pushed are carried out before anything
-	// else looks at the destination state (see deletions.go).
+	// else looks at the destination state (see deletions.go). Failure
+	// here (e.g. a merge-mangled deletion log) must not block the rest
+	// of the pass: with a nil baseline every missing file downgrades to
+	// the safe "apply it back" path below.
 	prevManaged, err := applyIncomingDeletions(lg)
 	if err != nil {
-		return err
+		lg.Printf("files: incoming deletions: %v (skipping)", err)
 	}
 	if err := ensureConfigManaged(cfg, lg); err != nil {
 		lg.Printf("files: %v", err)
@@ -365,10 +368,11 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		// machines move their copies to backups, and the content stays
 		// recoverable from the sync repo's history (`lichen recover`).
 		// `lichen remove` is the way to stop syncing while keeping every
-		// machine's copy.
+		// machine's copy. A failure only defers the deletion to the next
+		// pass, so it must not block the applies below.
 		slices.Sort(deleted)
 		if err := handleMissing(cfg, lg, prevManaged, slices.Compact(deleted)); err != nil {
-			return err
+			lg.Printf("files: deletions: %v (retrying next pass)", err)
 		}
 	}
 	if len(skipped) > 0 {
@@ -429,6 +433,12 @@ func restoreConfig(lg *log.Logger) {
 		return
 	}
 	lg.Printf("files: config missing, restoring it from the sync repo")
+	// chezmoi refuses to apply a target whose parent dir is missing on
+	// disk (install.sh works around it the same way).
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		lg.Printf("files: restore config: %v", err)
+		return
+	}
 	if _, err := chezmoi("apply", "--force", p); err != nil {
 		lg.Printf("files: restore config: %v", err)
 	}
@@ -475,14 +485,16 @@ func reAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 
 // LocalChange handles paths the watcher saw change: files still present
 // are captured with re-add, files now missing are deleted everywhere
-// (see deletions.go).
-func LocalChange(cfg *config.Config, lg *log.Logger, paths []string) error {
+// (see deletions.go). Reports whether the managed set changed, so the
+// watcher knows to rebuild its list.
+func LocalChange(cfg *config.Config, lg *log.Logger, paths []string) (bool, error) {
 	existing, missing := partitionExisting(paths)
 	var readdErr error
 	if len(existing) > 0 {
 		readdErr = reAddPush(cfg, lg, existing)
 	}
-	return errors.Join(readdErr, propagateDeletions(cfg, lg, missing))
+	changed, propErr := propagateDeletions(cfg, lg, missing)
+	return changed, errors.Join(readdErr, propErr)
 }
 
 // Sync starts managing new paths (chezmoi add) and pushes. The pre-lichen
@@ -495,6 +507,16 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	}
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized (re-run install.sh with LICHEN_REPO=<git url>)")
+	}
+	src, err := SourcePath()
+	if err != nil {
+		return err
+	}
+	// Pull first: the tombstone prune below must see deletions other
+	// machines pushed but this one has not applied yet, or a stale entry
+	// survives against the freshly re-synced path.
+	if err := pullRebase(src, lg); err != nil {
+		lg.Printf("files: pull: %v (continuing with local state)", err)
 	}
 	var absPaths []string
 	for _, p := range paths {
@@ -524,10 +546,6 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if _, err := chezmoi(append([]string{"add"}, paths...)...); err != nil {
 		return err
 	}
-	src, err := SourcePath()
-	if err != nil {
-		return err
-	}
 	// A path syncing (again) supersedes any recorded deletion of it: the
 	// prune rides along in the same commit.
 	if err := pruneDeletionLog(src, absPaths); err != nil {
@@ -547,11 +565,16 @@ func Remove(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized")
 	}
-	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {
-		return err
-	}
 	src, err := SourcePath()
 	if err != nil {
+		return err
+	}
+	// Pull first for the same reason as Sync: the defensive prune below
+	// must see the latest deletion log.
+	if err := pullRebase(src, lg); err != nil {
+		lg.Printf("files: pull: %v (continuing with local state)", err)
+	}
+	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {
 		return err
 	}
 	// Defensive: a stale recorded deletion overlapping these paths would
