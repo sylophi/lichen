@@ -1,5 +1,3 @@
-**NOTE** this project was created for personal use. I am unable to guarantee the quality or polish that one may expect from a properly maintained project.
-
 # lichen
 
 A project for easily keeping macOS dev environments in sync.
@@ -27,6 +25,15 @@ Then start syncing things:
 
 ```sh
 lichen sync ~/.zshrc ~/.claude/CLAUDE.md
+```
+
+Deletions sync too: delete a synced file on one machine and every other
+machine deletes its copy (moved into `~/lichen-backups/` first, never
+destroyed). A file deleted by mistake can be brought back from the sync
+repo's git history, on all machines at once:
+
+```sh
+lichen recover ~/.zshrc
 ```
 
 ## Updates

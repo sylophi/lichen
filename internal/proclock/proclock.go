@@ -3,7 +3,7 @@
 // source repo. The daemon's in-process mutex cannot see the CLI, so
 // without this an interleaving of the two destroys work staged in the git
 // repo or interleaves two chezmoi applies. Every mutating flow (a daemon
-// pass, a CLI sync or remove) holds this lock for its duration.
+// pass, a CLI sync or recover) holds this lock for its duration.
 package proclock
 
 import (

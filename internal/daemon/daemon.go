@@ -41,7 +41,16 @@ func Run() error {
 
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		// A missing config must heal HERE too, not only inside a pass:
+		// returning would make launchd's KeepAlive crash-loop the daemon
+		// without a pass ever running. The restore needs the lock.
+		if release, lerr := proclock.Acquire(ctx, nil); lerr == nil {
+			cfg, err = files.LoadConfig(lg)
+			release()
+		}
+		if err != nil {
+			return err
+		}
 	}
 	lg.Printf("lichen %s starting (server %s)", version.Current, cfg.Server())
 	hostname, _ := os.Hostname()
@@ -75,7 +84,7 @@ func Run() error {
 			return
 		}
 		defer release()
-		c, err := config.Load()
+		c, err := files.LoadConfig(lg)
 		if err != nil {
 			// The config may be mid-rewrite by an apply: skip this cycle.
 			lg.Printf("config: %v", err)
@@ -219,6 +228,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 	defer w.Close()
 
 	managed := map[string]bool{}
+	watchedDirs := map[string]bool{}
 	refresh := func() {
 		if !files.Active() {
 			return
@@ -243,6 +253,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			w.Add(d) // errors (e.g. dir not created yet) are retried on next refresh
 		}
 		managed = nm
+		watchedDirs = dirs
 	}
 	refresh()
 
@@ -259,7 +270,11 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			if !ok {
 				return
 			}
-			if managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+			// A watched dir DISAPPEARING matters too: deleting a whole
+			// synced directory can surface as one Remove for the dir,
+			// with no per-file events (kqueue).
+			if (managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0) ||
+				(watchedDirs[ev.Name] && ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0) {
 				pending[ev.Name] = true
 				debounce.Reset(1500 * time.Millisecond)
 			}
@@ -279,22 +294,26 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			// triggers the self-update here too (post-lock), so a machine
 			// whose user is actively editing does not wait for the hourly
 			// pass. The backoff keeps edit bursts from hammering it.
+			var shrunk bool
 			var repoV string
 			runLocked(func(c *config.Config) {
-				lg.Printf("files: local edit: %v", paths)
-				err := files.ReAddPush(c, lg, paths)
-				var outdated *files.OutdatedError
-				if errors.As(err, &outdated) {
-					lg.Printf("files: %v", outdated)
-					repoV = outdated.Repo
-					return
-				}
-				if err != nil {
+				lg.Printf("files: local change: %v", paths)
+				var err error
+				if shrunk, err = files.LocalChange(c, lg, paths); err != nil {
+					var outdated *files.OutdatedError
+					if errors.As(err, &outdated) {
+						repoV = outdated.Repo
+					}
 					lg.Printf("files: %v", err)
 				}
 			})
 			if repoV != "" {
 				autoUpdate(lg, repoV)
+			}
+			// Only a propagated deletion shrinks the managed set. Plain
+			// edits don't need the watch list rebuilt.
+			if shrunk {
+				refresh()
 			}
 		}
 	}
