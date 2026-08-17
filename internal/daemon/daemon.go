@@ -278,7 +278,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			// sequence as every other mutating flow. An outdated refusal
 			// triggers the self-update here too (post-lock), so a machine
 			// whose user is actively editing does not wait for the hourly
-			// pass; the backoff keeps edit bursts from hammering it.
+			// pass. The backoff keeps edit bursts from hammering it.
 			var repoV string
 			runLocked(func(c *config.Config) {
 				lg.Printf("files: local edit: %v", paths)

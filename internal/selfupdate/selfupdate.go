@@ -96,7 +96,7 @@ func download(tag, path string) (int64, error) {
 // Install downloads tag's binary for this platform and renames it over
 // the running executable. The temp name carries the pid: the daemon and
 // a CLI command can both be updating (neither holds the sync lock here),
-// and two writers on one temp file would corrupt the binary; distinct
+// and two writers on one temp file would corrupt the binary. Distinct
 // temp files make the last atomic rename win instead.
 func Install(tag string) error {
 	self, err := os.Executable()
@@ -140,8 +140,8 @@ func Required(repoV string) (string, error) {
 	return tag, nil
 }
 
-// ExecSelf replaces this process with the binary at its own path —
-// after an Install, that is the new build — preserving arguments and
+// ExecSelf replaces this process with the binary at its own path (after
+// an Install, that is the new build), preserving arguments and
 // environment (callers os.Setenv anything the new process must inherit,
 // which keeps repeated execs from stacking duplicate entries). Returns
 // only on failure.

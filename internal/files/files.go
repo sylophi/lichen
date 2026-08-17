@@ -411,7 +411,7 @@ func ensureConfigManaged(cfg *config.Config, lg *log.Logger) error {
 // ReAddPush captures local edits to managed files back into the sync repo
 // and pushes. Template-sourced files are skipped by chezmoi itself
 // (re-add never overwrites templates), and the caller surfaces which paths
-// were dropped. The gated entry point for the daemon's file watcher;
+// were dropped. The gated entry point for the daemon's file watcher.
 // Reconcile uses the ungated reAddPush, having gated its pass already.
 func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
@@ -572,7 +572,7 @@ func commitPush(cfg *config.Config, subject, body string, lg *log.Logger) error 
 		if _, perr := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); perr == nil {
 			// That pull may have delivered a version bump: restore it if
 			// the rebase kept a stale marker, and never push as a build
-			// that just turned out to be outdated — the local commit
+			// that just turned out to be outdated. The local commit
 			// waits for the post-update pass instead.
 			repairMarker(lg)
 			if gerr := gate(); gerr != nil {

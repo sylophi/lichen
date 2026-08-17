@@ -52,8 +52,8 @@ func gateAgainst(repoV string) error {
 // when the pull failed (unless there is no origin to race): a bump
 // computed against a marker that could not be refreshed may be stale
 // and, replayed by the local-wins rebase, would downgrade a newer
-// machine's bump. Record failures are logged, not fatal — version
-// bookkeeping must never stop syncing — except when the record's own
+// machine's bump. Record failures are logged, not fatal (version
+// bookkeeping must never stop syncing), except when the record's own
 // push retry discovered we are outdated after all.
 func syncMarker(cfg *config.Config, lg *log.Logger, pulled bool) error {
 	repairMarker(lg)
@@ -129,7 +129,7 @@ func repairMarker(lg *log.Logger) {
 
 // markerVersion reads the sync repo's version marker: "" when the file
 // is absent or malformed (no requirement), an error when it exists but
-// cannot be read — an unreadable marker must not silently disable the
+// cannot be read. An unreadable marker must not silently disable the
 // gate.
 func markerVersion() (string, error) {
 	src, err := SourcePath()

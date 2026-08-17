@@ -391,8 +391,8 @@ func cmdUpdate() error {
 		return nil
 	case version.Compare(tag, version.Current) < 0:
 		// A rollback: the latest published release is now OLDER than this
-		// build, meaning a release was deleted. Install it — this command
-		// is the only way off a pulled build — but loudly: the sync
+		// build, meaning a release was deleted. This command is the only
+		// way off a pulled build, so install it, but loudly: the sync
 		// repo's marker may still require the deleted version and needs
 		// lowering by hand.
 		fmt.Printf("latest release %s is older than this build (%s): a release was deleted, downgrading.\n", tag, version.Current)
