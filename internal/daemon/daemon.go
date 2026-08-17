@@ -8,6 +8,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"maps"
 	"os"
@@ -24,6 +25,8 @@ import (
 	"lichen/internal/events"
 	"lichen/internal/files"
 	"lichen/internal/proclock"
+	"lichen/internal/selfupdate"
+	"lichen/internal/version"
 )
 
 // pollInterval catches whatever the event stream missed: a push that
@@ -31,7 +34,7 @@ import (
 // configured.
 const pollInterval = time.Hour
 
-func Run(version string) error {
+func Run() error {
 	lg := log.New(os.Stdout, "", log.LstdFlags)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -40,7 +43,7 @@ func Run(version string) error {
 	if err != nil {
 		return err
 	}
-	lg.Printf("lichen %s starting (server %s)", version, cfg.Server())
+	lg.Printf("lichen %s starting (server %s)", version.Current, cfg.Server())
 	hostname, _ := os.Hostname()
 
 	// One mutex serializes every pass: a startup pass, the hourly pass,
@@ -82,7 +85,14 @@ func Run(version string) error {
 	}
 	reconcile := func() {
 		runLocked(func(c *config.Config) {
-			if err := files.Reconcile(c, lg); err != nil {
+			err := files.Reconcile(c, lg)
+			var outdated *files.OutdatedError
+			if errors.As(err, &outdated) {
+				lg.Printf("files: %v", outdated)
+				autoUpdate(lg, outdated.Repo)
+				return
+			}
+			if err != nil {
 				lg.Printf("files: reconcile: %v", err)
 			}
 			nudgeWatch()
@@ -141,6 +151,27 @@ func Run(version string) error {
 		handle)
 	lg.Printf("lichen stopped")
 	return nil
+}
+
+// autoUpdate installs the release the sync repo requires and execs it in
+// place of this process: launchd sees the same PID, so KeepAlive's
+// restart throttle never enters the picture. On failure the daemon stays
+// up with syncing paused, and the next pass (event or hourly) retries.
+func autoUpdate(lg *log.Logger, repoV string) {
+	tag, err := selfupdate.Required(repoV)
+	if err != nil {
+		lg.Printf("update: %v (syncing stays paused, retrying on the next pass)", err)
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		lg.Printf("update: %v", err)
+		return
+	}
+	lg.Printf("update: installed %s, restarting the daemon on it", tag)
+	if err := syscall.Exec(self, os.Args, os.Environ()); err != nil {
+		lg.Printf("update: exec: %v", err)
+	}
 }
 
 // watchFiles pushes local edits out: fsnotify on the parent directories of

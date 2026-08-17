@@ -28,3 +28,10 @@ Then start syncing things:
 ```sh
 lichen sync ~/.zshrc ~/.claude/CLAUDE.md
 ```
+
+## Updates
+
+`lichen update` installs the latest release. The sync repo records the
+newest lichen version that has synced with it, and a machine running an
+older build pauses syncing and updates itself automatically, so
+updating one machine brings the whole fleet along.

@@ -6,20 +6,16 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strings"
 	"syscall"
-	"time"
 
 	"lichen/internal/backup"
 	"lichen/internal/config"
@@ -28,11 +24,9 @@ import (
 	"lichen/internal/files"
 	"lichen/internal/gitutil"
 	"lichen/internal/proclock"
+	"lichen/internal/selfupdate"
+	"lichen/internal/version"
 )
-
-// version is stamped by the release workflow via
-// -ldflags "-X main.version=<tag>". Source builds stay "dev".
-var version = "dev"
 
 func main() {
 	log.SetFlags(0)
@@ -54,7 +48,7 @@ func main() {
 	case "logs":
 		err = cmdLogs()
 	case "daemon":
-		err = daemon.Run(version)
+		err = daemon.Run()
 	case "start", "stop", "restart":
 		err = cmdDaemonCtl(args[0])
 	case "update":
@@ -62,7 +56,7 @@ func main() {
 	case "uninstall":
 		err = cmdUninstall(args[1:])
 	case "version", "--version":
-		fmt.Println("lichen " + version)
+		fmt.Println("lichen " + version.Current)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -70,9 +64,41 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	// The version gate refused the command: this build is older than the
+	// sync repo requires. Update in place and rerun.
+	var outdated *files.OutdatedError
+	if errors.As(err, &outdated) {
+		err = updateAndRerun(outdated)
+	}
 	if err != nil {
 		log.Fatalf("lichen: %v", err)
 	}
+}
+
+// updateAndRerun installs the release the sync repo requires, restarts
+// the daemon on it, and execs the original command on the new binary.
+// The env guard breaks the loop if the rerun is somehow still refused.
+func updateAndRerun(outdated *files.OutdatedError) error {
+	if os.Getenv("LICHEN_AUTOUPDATED") != "" {
+		return outdated
+	}
+	fmt.Printf("lichen %s is behind the sync repo (%s): updating...\n", outdated.Build, outdated.Repo)
+	tag, err := selfupdate.Required(outdated.Repo)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("updated %s -> %s\n", outdated.Build, tag)
+	if daemonLoaded() {
+		if err := launchctlRun("kickstart", "-k", daemonTarget()); err == nil {
+			fmt.Println("daemon restarted on the new build")
+		}
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	fmt.Println("rerunning the command on the new build...")
+	return syscall.Exec(self, os.Args, append(os.Environ(), "LICHEN_AUTOUPDATED=1"))
 }
 
 func usage() {
@@ -341,118 +367,29 @@ func cmdDaemonCtl(action string) error {
 	return nil
 }
 
-const releaseRepo = "dittofleet/lichen"
-
-// httpGet fetches url, treating any non-200 as an error. The timeout
-// covers the whole exchange, body read included. Callers close the body.
-func httpGet(url, accept string, timeout time.Duration) (*http.Response, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if accept != "" {
-		req.Header.Set("Accept", accept)
-	}
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-	return resp, nil
-}
-
-// latestReleaseTag returns the tag_name of the latest GitHub release.
-func latestReleaseTag() (string, error) {
-	resp, err := httpGet("https://api.github.com/repos/"+releaseRepo+"/releases/latest", "application/vnd.github+json", 10*time.Second)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var data struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return "", err
-	}
-	if data.TagName == "" {
-		return "", fmt.Errorf("release metadata has no tag_name")
-	}
-	return data.TagName, nil
-}
-
-// downloadRelease streams the tagged release asset for this platform
-// into path (mode 0755), returning the byte count. The caller cleans up
-// on error. Asset names here, install.sh's download URL, and the
-// release workflow's build matrix must all agree.
-func downloadRelease(tag, path string) (int64, error) {
-	var arch string
-	switch runtime.GOOS + "/" + runtime.GOARCH {
-	case "darwin/arm64":
-		arch = "arm64"
-	case "darwin/amd64":
-		arch = "x64"
-	default:
-		return 0, fmt.Errorf("unsupported platform: %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/lichen-darwin-%s", releaseRepo, tag, arch)
-	resp, err := httpGet(url, "", 5*time.Minute)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
-	if err != nil {
-		return 0, err
-	}
-	n, copyErr := io.Copy(f, resp.Body)
-	closeErr := f.Close()
-	if copyErr != nil {
-		return n, copyErr
-	}
-	return n, closeErr
-}
-
 // cmdUpdate self-updates to the latest GitHub release: fetch the latest
 // tag, download this platform's asset, and rename it over the running
 // binary.
 func cmdUpdate() error {
-	if version == "dev" {
+	if !version.IsRelease() {
 		return fmt.Errorf("dev build (built from source): update by re-running dev.sh, or install the released binary via install.sh")
 	}
 	fmt.Println("checking the latest release...")
-	tag, err := latestReleaseTag()
+	tag, err := selfupdate.LatestTag()
 	if err != nil {
 		return fmt.Errorf("fetching release info: %w", err)
 	}
-	if tag == version {
-		fmt.Println("already at the latest release: " + version)
+	// <= keeps a deleted release from quietly downgrading this machine
+	// below what the sync repo's version gate requires.
+	if version.Valid(tag) && version.Compare(tag, version.Current) <= 0 {
+		fmt.Println("already at the latest release: " + version.Current)
 		return nil
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
 	fmt.Printf("downloading %s...\n", tag)
-	tmp := self + ".update"
-	n, err := downloadRelease(tag, tmp)
-	if err != nil {
-		os.Remove(tmp)
+	if err := selfupdate.Install(tag); err != nil {
 		return err
 	}
-	// Reject a download too small to be a real build (an error page or a
-	// truncated transfer).
-	if n < 1_000_000 {
-		os.Remove(tmp)
-		return fmt.Errorf("downloaded file is suspiciously small (%d bytes), aborting", n)
-	}
-	if err := os.Rename(tmp, self); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	fmt.Printf("updated %s -> %s\n", version, tag)
+	fmt.Printf("updated %s -> %s\n", version.Current, tag)
 	if daemonLoaded() {
 		if err := launchctlRun("kickstart", "-k", daemonTarget()); err == nil {
 			fmt.Println("daemon restarted on the new build")

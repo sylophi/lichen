@@ -272,7 +272,8 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		return err
 	}
 	abortStaleRebase(src, lg)
-	if Origin() != "" {
+	hasOrigin := Origin() != ""
+	if hasOrigin {
 		// Rebase (not ff-only) so a locally-committed-but-unpushed change
 		// doesn't wedge the pull forever. -X theirs prefers OUR replayed
 		// commits on conflict (rebase swaps sides), matching lichen's
@@ -281,6 +282,14 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 			abortStaleRebase(src, lg)
 			lg.Printf("files: pull: %v (continuing with local state)", err)
 		}
+	}
+	// The version gate sits between the pull and everything else: the
+	// pull is what delivers another machine's version bump, and a build
+	// that turns out to be stale must neither push nor apply anything.
+	if err := gate(cfg, lg); err != nil {
+		return err
+	}
+	if hasOrigin {
 		// A rebase (or an earlier offline commit) can leave us ahead of
 		// origin with nothing new to stage. Push those commits now
 		// rather than waiting for the next local edit.
@@ -404,6 +413,9 @@ func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return nil
 	}
+	if err := gate(cfg, lg); err != nil {
+		return err
+	}
 	args := append([]string{"re-add"}, paths...)
 	if out, err := chezmoi(args...); err != nil {
 		return err
@@ -423,6 +435,9 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	}
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized (re-run install.sh with LICHEN_REPO=<git url>)")
+	}
+	if err := gate(cfg, lg); err != nil {
+		return err
 	}
 	for _, p := range paths {
 		abs, err := absPath(p)
@@ -458,6 +473,9 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 func Remove(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized")
+	}
+	if err := gate(cfg, lg); err != nil {
+		return err
 	}
 	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {
 		return err

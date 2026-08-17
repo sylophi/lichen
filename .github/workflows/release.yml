@@ -51,7 +51,7 @@ jobs:
             [ "$arch" = "x64" ] && goarch=amd64
             CGO_ENABLED=0 GOOS=darwin GOARCH=$goarch \
               go build -trimpath \
-                -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+                -ldflags="-s -w -X lichen/internal/version.Current=${{ github.ref_name }}" \
                 -o dist/lichen-${combo} .
           done
 
