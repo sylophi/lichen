@@ -498,6 +498,9 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 	if err := pullRebase(src, lg); err != nil {
 		lg.Printf("files: pull: %v (recovering from the local clone's history)", err)
 	}
+	if err := gate(); err != nil {
+		return nil, err
+	}
 	dlog, err := loadDeletionLog(src)
 	if err != nil {
 		return nil, err

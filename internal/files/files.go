@@ -315,8 +315,18 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	if err != nil {
 		return err
 	}
+	// pulled means the marker is fresh (a no-origin repo has nothing to
+	// race, so recording is always safe there).
+	pulled := true
 	if err := pullRebase(src, lg); err != nil {
+		pulled = false
 		lg.Printf("files: pull: %v (continuing with local state)", err)
+	}
+	// The marker pass sits between the pull and everything else: the pull
+	// is what delivers another machine's version bump, and a build that
+	// turns out to be stale must neither push nor apply anything.
+	if err := syncMarker(cfg, lg, pulled); err != nil {
+		return err
 	}
 	if Origin() != "" {
 		// A rebase (or an earlier offline commit) can leave us ahead of
@@ -503,6 +513,9 @@ func reAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 // (see deletions.go). Reports whether the managed set changed, so the
 // watcher knows to rebuild its list.
 func LocalChange(cfg *config.Config, lg *log.Logger, paths []string) (bool, error) {
+	if err := gate(); err != nil {
+		return false, err
+	}
 	existing, missing := partitionExisting(paths)
 	var readdErr error
 	if len(existing) > 0 {
@@ -529,9 +542,13 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	}
 	// Pull first: the tombstone prune below must see deletions other
 	// machines pushed but this one has not applied yet, or a stale entry
-	// survives against the freshly re-synced path.
+	// survives against the freshly re-synced path. The version gate runs
+	// on the freshly pulled marker for the same reason.
 	if err := pullRebase(src, lg); err != nil {
 		lg.Printf("files: pull: %v (continuing with local state)", err)
+	}
+	if err := gate(); err != nil {
+		return err
 	}
 	var absPaths []string
 	for _, p := range paths {
@@ -649,6 +666,14 @@ func commitPush(cfg *config.Config, subject, body string, lg *log.Logger) error 
 		// A racing push from another machine or being offline is routine:
 		// try once behind a rebase, else leave it for the next pass.
 		if pullRebase(src, lg) == nil {
+			// That pull may have delivered a version bump: restore it if
+			// the rebase kept a stale marker, and never push as a build
+			// that just turned out to be outdated. The local commit
+			// waits for the post-update pass instead.
+			repairMarker(lg)
+			if gerr := gate(); gerr != nil {
+				return gerr
+			}
 			if _, err2 := gitutil.Run(src, "push", "--quiet"); err2 == nil {
 				announce(cfg, lg)
 				return nil

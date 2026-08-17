@@ -8,6 +8,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"maps"
 	"os"
@@ -24,6 +25,8 @@ import (
 	"lichen/internal/events"
 	"lichen/internal/files"
 	"lichen/internal/proclock"
+	"lichen/internal/selfupdate"
+	"lichen/internal/version"
 )
 
 // pollInterval catches whatever the event stream missed: a push that
@@ -31,7 +34,7 @@ import (
 // configured.
 const pollInterval = time.Hour
 
-func Run(version string) error {
+func Run() error {
 	lg := log.New(os.Stdout, "", log.LstdFlags)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -49,7 +52,7 @@ func Run(version string) error {
 			return err
 		}
 	}
-	lg.Printf("lichen %s starting (server %s)", version, cfg.Server())
+	lg.Printf("lichen %s starting (server %s)", version.Current, cfg.Server())
 	hostname, _ := os.Hostname()
 
 	// One mutex serializes every pass: a startup pass, the hourly pass,
@@ -90,12 +93,26 @@ func Run(version string) error {
 		fn(c)
 	}
 	reconcile := func() {
+		var repoV string
 		runLocked(func(c *config.Config) {
-			if err := files.Reconcile(c, lg); err != nil {
+			err := files.Reconcile(c, lg)
+			var outdated *files.OutdatedError
+			if errors.As(err, &outdated) {
+				lg.Printf("files: %v", outdated)
+				repoV = outdated.Repo
+				return
+			}
+			if err != nil {
 				lg.Printf("files: reconcile: %v", err)
 			}
 			nudgeWatch()
 		})
+		// The update runs AFTER the locks are released: the download needs
+		// neither, and holding them through a slow network would block
+		// every CLI command and queued pass for its duration.
+		if repoV != "" {
+			autoUpdate(lg, repoV)
+		}
 	}
 
 	// The startup pass runs in the background so the daemon is subscribed
@@ -150,6 +167,50 @@ func Run(version string) error {
 		handle)
 	lg.Printf("lichen stopped")
 	return nil
+}
+
+// updateBackoff spaces out failed auto-update attempts: the release
+// download is the biggest I/O the daemon ever does, so an event burst
+// must not repeat it back-to-back. The hourly pass is the natural retry.
+const updateBackoff = 10 * time.Minute
+
+// updateMu serializes update attempts (the reconcile and watcher paths
+// both trigger them, outside runLocked) and guards lastUpdateAttempt. A
+// successful attempt never records itself: the process is replaced.
+var updateMu sync.Mutex
+var lastUpdateAttempt time.Time
+
+// autoUpdate installs the release the sync repo requires and execs it in
+// place of this process: launchd sees the same PID, so KeepAlive's
+// restart throttle never enters the picture. On failure the daemon stays
+// up with syncing paused until a later pass gets through.
+//
+// The env guard survives the exec, unlike lastUpdateAttempt: if the
+// installed release does not actually clear the requirement it was
+// installed for (a mis-stamped asset), the fresh process must not
+// download it again in a tight loop. A LATER requirement re-arms it.
+func autoUpdate(lg *log.Logger, repoV string) {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+	if os.Getenv("LICHEN_AUTOUPDATED") == repoV {
+		lg.Printf("update: already self-updated for %s yet still outdated (mis-stamped release?), not retrying", repoV)
+		return
+	}
+	if since := time.Since(lastUpdateAttempt); since < updateBackoff {
+		lg.Printf("update: last attempt failed %s ago, backing off", since.Round(time.Second))
+		return
+	}
+	lastUpdateAttempt = time.Now()
+	tag, err := selfupdate.Required(repoV)
+	if err != nil {
+		lg.Printf("update: %v (syncing stays paused, retrying on a later pass)", err)
+		return
+	}
+	lg.Printf("update: installed %s, restarting the daemon on it", tag)
+	os.Setenv("LICHEN_AUTOUPDATED", repoV)
+	if err := selfupdate.ExecSelf(); err != nil {
+		lg.Printf("update: exec: %v", err)
+	}
 }
 
 // watchFiles pushes local edits out: fsnotify on the parent directories of
@@ -229,15 +290,26 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			paths := slices.Sorted(maps.Keys(pending))
 			pending = map[string]bool{}
 			// runLocked provides the same mutex and cross-process lock
-			// sequence as every other mutating flow.
+			// sequence as every other mutating flow. An outdated refusal
+			// triggers the self-update here too (post-lock), so a machine
+			// whose user is actively editing does not wait for the hourly
+			// pass. The backoff keeps edit bursts from hammering it.
 			var shrunk bool
+			var repoV string
 			runLocked(func(c *config.Config) {
 				lg.Printf("files: local change: %v", paths)
 				var err error
 				if shrunk, err = files.LocalChange(c, lg, paths); err != nil {
+					var outdated *files.OutdatedError
+					if errors.As(err, &outdated) {
+						repoV = outdated.Repo
+					}
 					lg.Printf("files: %v", err)
 				}
 			})
+			if repoV != "" {
+				autoUpdate(lg, repoV)
+			}
 			// Only a propagated deletion shrinks the managed set. Plain
 			// edits don't need the watch list rebuilt.
 			if shrunk {
