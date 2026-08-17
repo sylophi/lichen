@@ -1,8 +1,9 @@
-// Package daemon is lichen's long-running core: reconcile on start, then
-// react to the sync repo moving (via one idle ntfy stream) and to local
-// edits of managed files (via fsnotify). An hourly pass is the backstop
-// for events that never arrived. Each pass re-reads the config. Only the
-// topic and server are fixed until restart.
+// Package daemon is lichen's long-running core: reconcile every module
+// on start, then react to the sync repo moving (via one idle ntfy
+// stream) and to local edits of managed files (via fsnotify). An hourly
+// pass is the backstop for events that never arrived, and doubles as the
+// skills module's poll of its upstream repos. Each pass re-reads the
+// config. Only the topic and server are fixed until restart.
 package daemon
 
 import (
@@ -24,8 +25,10 @@ import (
 	"lichen/internal/config"
 	"lichen/internal/events"
 	"lichen/internal/files"
+	"lichen/internal/module"
 	"lichen/internal/proclock"
 	"lichen/internal/selfupdate"
+	"lichen/internal/skills"
 	"lichen/internal/version"
 )
 
@@ -95,15 +98,16 @@ func Run() error {
 	reconcile := func() {
 		var repoV string
 		runLocked(func(c *config.Config) {
-			err := files.Reconcile(c, lg)
+			err := module.ReconcileAll(c, lg)
+			// An outdated refusal pauses file syncing and triggers the
+			// self-update below. It rides the joined error, so the other
+			// modules' failures still get logged alongside it.
 			var outdated *files.OutdatedError
 			if errors.As(err, &outdated) {
-				lg.Printf("files: %v", outdated)
 				repoV = outdated.Repo
-				return
 			}
 			if err != nil {
-				lg.Printf("files: reconcile: %v", err)
+				lg.Printf("reconcile: %v", err)
 			}
 			nudgeWatch()
 		})
@@ -305,6 +309,16 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 						repoV = outdated.Repo
 					}
 					lg.Printf("files: %v", err)
+				}
+				// A hand-edited module config (say, skills.json's
+				// harnesses list) reaches the other machines via the
+				// push above. Reconcile skills HERE too, or the machine
+				// the user typed on would be the last to converge.
+				owned := config.OwnedPaths()
+				if slices.ContainsFunc(paths, func(p string) bool { return slices.Contains(owned, p) }) {
+					if err := skills.Reconcile(lg); err != nil {
+						lg.Printf("skills: %v", err)
+					}
 				}
 			})
 			if repoV != "" {

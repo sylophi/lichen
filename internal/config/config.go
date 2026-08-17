@@ -1,8 +1,9 @@
-// Package config defines lichen's single config file at
-// ~/.config/lichen/config.json. The file is itself synced across machines,
-// so everything in it is machine-portable. lichen edits it only through
-// chezmoi: the installer seeds it, and an apply can replace it with
-// another machine's version.
+// Package config defines lichen's config files under ~/.config/lichen,
+// one per owner: config.json (the event channel, seeded by the
+// installer) and skills.json (skill sources, rewritten by the skills
+// CLI). Both are synced across machines, so everything in them is
+// machine-portable, and an apply can replace either with another
+// machine's version.
 package config
 
 import (
@@ -27,30 +28,47 @@ var homeOnce = sync.OnceValues(os.UserHomeDir)
 
 func Home() (string, error) { return homeOnce() }
 
-func Path() (string, error) {
+// HomeJoin resolves a path under the home directory.
+func HomeJoin(parts ...string) (string, error) {
 	home, err := Home()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".config", "lichen", "config.json"), nil
+	return filepath.Join(append([]string{home}, parts...)...), nil
 }
 
-// DataDir holds lichen's machine-local scratch: the cross-process lock
-// and the managed-set manifest.
-func DataDir() (string, error) {
-	home, err := Home()
-	if err != nil {
-		return "", err
+func Path() (string, error) {
+	return HomeJoin(".config", "lichen", "config.json")
+}
+
+// SkillsPath is the skills module's config: which skill repos to sync.
+// A separate file so each synced config file has exactly one writer.
+func SkillsPath() (string, error) {
+	return HomeJoin(".config", "lichen", "skills.json")
+}
+
+// OwnedPaths are the config files lichen itself writes: the set the
+// files module keeps in the sync repo. Empty when home can't resolve.
+func OwnedPaths() []string {
+	var paths []string
+	if p, err := Path(); err == nil {
+		paths = append(paths, p)
 	}
-	return filepath.Join(home, ".local", "share", "lichen"), nil
+	if p, err := SkillsPath(); err == nil {
+		paths = append(paths, p)
+	}
+	return paths
+}
+
+// DataDir holds lichen's machine-local state: the cross-process lock,
+// the managed-set manifest, the skills manifest, and the skill repo
+// clones.
+func DataDir() (string, error) {
+	return HomeJoin(".local", "share", "lichen")
 }
 
 func LogPath() (string, error) {
-	home, err := Home()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, "Library", "Logs", "lichen.log"), nil
+	return HomeJoin("Library", "Logs", "lichen.log")
 }
 
 func Load() (*Config, error) {
