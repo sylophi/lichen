@@ -26,3 +26,12 @@ Then start syncing things:
 ```sh
 lichen sync ~/.zshrc ~/.claude/CLAUDE.md
 ```
+
+Deletions sync too: delete a synced file on one machine and every other
+machine deletes its copy (moved into `~/lichen-backups/` first, never
+destroyed). A file deleted by mistake can be brought back from the sync
+repo's git history, on all machines at once:
+
+```sh
+lichen recover ~/.zshrc
+```

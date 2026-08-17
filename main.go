@@ -47,8 +47,8 @@ func main() {
 		err = cmdStatus(slices.Contains(args[1:], "--secrets"))
 	case "sync":
 		err = withLock(func() error { return cmdSync(args[1:]) })
-	case "remove", "rm":
-		err = withLock(func() error { return cmdRemove(args[1:]) })
+	case "recover":
+		err = withLock(func() error { return cmdRecover(args[1:]) })
 	case "list", "ls":
 		err = cmdList()
 	case "logs":
@@ -80,7 +80,7 @@ func usage() {
 
   lichen sync <path...>            start syncing files across machines
   lichen sync                      pull and apply everything now
-  lichen remove <path...>          stop syncing (local copies stay)
+  lichen recover <path...>         bring back files deleted everywhere
   lichen list                      show every synced file
 
   lichen status [--secrets]        daemon health and webhook setup
@@ -91,7 +91,7 @@ func usage() {
   lichen uninstall [--yes]         remove lichen, keep your files
   lichen version                   print the installed version
 
-aliases: rm = remove, ls = list
+aliases: ls = list
 setup: install.sh   teardown: uninstall.sh (or lichen uninstall)
 `)
 	// `lichen daemon` is deliberately absent: it's launchd's entry point
@@ -137,11 +137,11 @@ func dim(s string) string  { return paint("2", s) }
 // cmdSync with paths starts managing them. With none it runs a full pass:
 // pull, capture local edits, apply.
 func cmdSync(paths []string) error {
-	cfg, err := config.Load()
+	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
 	if err != nil {
 		return err
 	}
-	lg := clilog()
 	if len(paths) == 0 {
 		if err := files.Reconcile(cfg, lg); err != nil {
 			return err
@@ -156,18 +156,24 @@ func cmdSync(paths []string) error {
 	return nil
 }
 
-func cmdRemove(paths []string) error {
+func cmdRecover(paths []string) error {
 	if len(paths) == 0 {
-		return fmt.Errorf("usage: lichen remove <path...>")
+		return fmt.Errorf("usage: lichen recover <path...>")
 	}
-	cfg, err := config.Load()
+	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
 	if err != nil {
 		return err
 	}
-	if err := files.Remove(cfg, clilog(), paths); err != nil {
+	recovered, err := files.Recover(cfg, lg, paths)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("stopped syncing: %s (local copies left in place)\n", strings.Join(paths, ", "))
+	if len(recovered) == 0 {
+		fmt.Println("nothing to recover")
+		return nil
+	}
+	fmt.Printf("recovered: %s\n", strings.Join(recovered, ", "))
 	return nil
 }
 

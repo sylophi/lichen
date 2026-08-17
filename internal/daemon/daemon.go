@@ -38,7 +38,16 @@ func Run(version string) error {
 
 	cfg, err := config.Load()
 	if err != nil {
-		return err
+		// A missing config must heal HERE too, not only inside a pass:
+		// returning would make launchd's KeepAlive crash-loop the daemon
+		// without a pass ever running. The restore needs the lock.
+		if release, lerr := proclock.Acquire(ctx, nil); lerr == nil {
+			cfg, err = files.LoadConfig(lg)
+			release()
+		}
+		if err != nil {
+			return err
+		}
 	}
 	lg.Printf("lichen %s starting (server %s)", version, cfg.Server())
 	hostname, _ := os.Hostname()
@@ -72,7 +81,7 @@ func Run(version string) error {
 			return
 		}
 		defer release()
-		c, err := config.Load()
+		c, err := files.LoadConfig(lg)
 		if err != nil {
 			// The config may be mid-rewrite by an apply: skip this cycle.
 			lg.Printf("config: %v", err)
@@ -158,6 +167,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 	defer w.Close()
 
 	managed := map[string]bool{}
+	watchedDirs := map[string]bool{}
 	refresh := func() {
 		if !files.Active() {
 			return
@@ -182,6 +192,7 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			w.Add(d) // errors (e.g. dir not created yet) are retried on next refresh
 		}
 		managed = nm
+		watchedDirs = dirs
 	}
 	refresh()
 
@@ -198,7 +209,11 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			if !ok {
 				return
 			}
-			if managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+			// A watched dir DISAPPEARING matters too: deleting a whole
+			// synced directory can surface as one Remove for the dir,
+			// with no per-file events (kqueue).
+			if (managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0) ||
+				(watchedDirs[ev.Name] && ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0) {
 				pending[ev.Name] = true
 				debounce.Reset(1500 * time.Millisecond)
 			}
@@ -215,12 +230,19 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			pending = map[string]bool{}
 			// runLocked provides the same mutex and cross-process lock
 			// sequence as every other mutating flow.
+			var shrunk bool
 			runLocked(func(c *config.Config) {
-				lg.Printf("files: local edit: %v", paths)
-				if err := files.ReAddPush(c, lg, paths); err != nil {
+				lg.Printf("files: local change: %v", paths)
+				var err error
+				if shrunk, err = files.LocalChange(c, lg, paths); err != nil {
 					lg.Printf("files: %v", err)
 				}
 			})
+			// Only a propagated deletion shrinks the managed set. Plain
+			// edits don't need the watch list rebuilt.
+			if shrunk {
+				refresh()
+			}
 		}
 	}
 }

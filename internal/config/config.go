@@ -35,8 +35,8 @@ func Path() (string, error) {
 	return filepath.Join(home, ".config", "lichen", "config.json"), nil
 }
 
-// DataDir holds lichen's machine-local scratch, currently just the
-// cross-process lock.
+// DataDir holds lichen's machine-local scratch: the cross-process lock
+// and the managed-set manifest.
 func DataDir() (string, error) {
 	home, err := Home()
 	if err != nil {
