@@ -139,6 +139,26 @@ func Managed() ([]string, error) {
 	return managedPaths("files")
 }
 
+// isManaged reports whether chezmoi manages the path.
+func isManaged(abs string) bool {
+	_, err := chezmoi("source-path", abs)
+	return err == nil
+}
+
+// applyBack puts managed paths back on disk. chezmoi refuses to apply a
+// target whose parent dir is missing on disk (install.sh works around
+// it the same way), so parents are created first: the apply itself then
+// corrects their modes.
+func applyBack(paths []string) error {
+	for _, p := range paths {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+	}
+	_, err := chezmoi(append([]string{"apply", "--force"}, paths...)...)
+	return err
+}
+
 // entryStatePaths returns the set of destination paths chezmoi has itself
 // written (its persistent state). Presence here is what separates "user
 // edited a file we manage" from "file predates chezmoi on this machine".
@@ -327,8 +347,10 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		return err
 	}
 
-	// The entry-state dump is fetched once per pass: re-add doesn't write
-	// destinations, so the post-re-add re-classify can reuse it.
+	// The entry-state dump is fetched once for both classify calls:
+	// re-add doesn't write destinations, so the post-re-add re-classify
+	// can reuse it. (The deletion paths take their own snapshots, since
+	// they run after state has been mutated.)
 	written, err := entryStatePaths()
 	if err != nil {
 		return err
@@ -428,17 +450,11 @@ func restoreConfig(lg *log.Logger) {
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		return
 	}
-	if _, err := chezmoi("source-path", p); err != nil {
+	if !isManaged(p) {
 		return
 	}
 	lg.Printf("files: config missing, restoring it from the sync repo")
-	// chezmoi refuses to apply a target whose parent dir is missing on
-	// disk (install.sh works around it the same way).
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		lg.Printf("files: restore config: %v", err)
-		return
-	}
-	if _, err := chezmoi("apply", "--force", p); err != nil {
+	if err := applyBack([]string{p}); err != nil {
 		lg.Printf("files: restore config: %v", err)
 	}
 }
@@ -455,7 +471,7 @@ func ensureConfigManaged(cfg *config.Config, lg *log.Logger) error {
 	if _, err := os.Stat(cfgPath); err != nil {
 		return nil
 	}
-	if _, err := chezmoi("source-path", cfgPath); err == nil {
+	if isManaged(cfgPath) {
 		return nil
 	}
 	lg.Printf("files: adding %s to the sync repo", cfgPath)
@@ -533,7 +549,7 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 		if _, err := os.Stat(abs); err != nil {
 			continue // chezmoi add will report the missing path
 		}
-		if _, err := chezmoi("source-path", abs); err == nil {
+		if isManaged(abs) {
 			continue // already managed: re-syncs don't re-backup
 		}
 		to, err := backup.Copy(abs)

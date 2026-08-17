@@ -212,8 +212,8 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			// A watched dir DISAPPEARING matters too: deleting a whole
 			// synced directory can surface as one Remove for the dir,
 			// with no per-file events (kqueue).
-			if managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 ||
-				watchedDirs[ev.Name] && ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
+			if (managed[ev.Name] && ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0) ||
+				(watchedDirs[ev.Name] && ev.Op&(fsnotify.Rename|fsnotify.Remove) != 0) {
 				pending[ev.Name] = true
 				debounce.Reset(1500 * time.Millisecond)
 			}
@@ -233,9 +233,8 @@ func watchFiles(ctx context.Context, lg *log.Logger, runLocked func(func(*config
 			var shrunk bool
 			runLocked(func(c *config.Config) {
 				lg.Printf("files: local change: %v", paths)
-				changed, err := files.LocalChange(c, lg, paths)
-				shrunk = changed
-				if err != nil {
+				var err error
+				if shrunk, err = files.LocalChange(c, lg, paths); err != nil {
 					lg.Printf("files: %v", err)
 				}
 			})
