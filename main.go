@@ -77,9 +77,12 @@ func main() {
 
 // updateAndRerun installs the release the sync repo requires, restarts
 // the daemon on it, and execs the original command on the new binary.
-// The env guard breaks the loop if the rerun is somehow still refused.
+// The env guard is keyed to the requirement that triggered the update:
+// a rerun refused by the SAME requirement means the install didn't take
+// (mis-stamped release) and must not loop, while a strictly newer
+// requirement arriving mid-flight legitimately updates once more.
 func updateAndRerun(outdated *files.OutdatedError) error {
-	if os.Getenv("LICHEN_AUTOUPDATED") != "" {
+	if os.Getenv("LICHEN_AUTOUPDATED") == outdated.Repo {
 		return outdated
 	}
 	fmt.Printf("lichen %s is behind the sync repo (%s): updating...\n", outdated.Build, outdated.Repo)
@@ -90,7 +93,8 @@ func updateAndRerun(outdated *files.OutdatedError) error {
 	fmt.Printf("updated %s -> %s\n", outdated.Build, tag)
 	restartDaemonIfLoaded()
 	fmt.Println("rerunning the command on the new build...")
-	return selfupdate.ExecSelf("LICHEN_AUTOUPDATED=1")
+	os.Setenv("LICHEN_AUTOUPDATED", outdated.Repo)
+	return selfupdate.ExecSelf()
 }
 
 // restartDaemonIfLoaded bounces the launchd agent so it picks up a
@@ -381,11 +385,18 @@ func cmdUpdate() error {
 	if err != nil {
 		return err
 	}
-	// <= keeps a deleted release from quietly downgrading this machine
-	// below what the sync repo's version gate requires.
-	if version.Compare(tag, version.Current) <= 0 {
+	switch {
+	case tag == version.Current:
 		fmt.Println("already at the latest release: " + version.Current)
 		return nil
+	case version.Compare(tag, version.Current) < 0:
+		// A rollback: the latest published release is now OLDER than this
+		// build, meaning a release was deleted. Install it — this command
+		// is the only way off a pulled build — but loudly: the sync
+		// repo's marker may still require the deleted version and needs
+		// lowering by hand.
+		fmt.Printf("latest release %s is older than this build (%s): a release was deleted, downgrading.\n", tag, version.Current)
+		fmt.Printf("If syncing pauses afterwards, lower %s in the sync repo to %s or below.\n", version.Marker, tag)
 	}
 	fmt.Printf("downloading %s...\n", tag)
 	if err := selfupdate.Install(tag); err != nil {

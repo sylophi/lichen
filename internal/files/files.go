@@ -273,6 +273,7 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	}
 	abortStaleRebase(src, lg)
 	hasOrigin := Origin() != ""
+	pulled := !hasOrigin // no origin: nothing to race, recording is safe
 	if hasOrigin {
 		// Rebase (not ff-only) so a locally-committed-but-unpushed change
 		// doesn't wedge the pull forever. -X theirs prefers OUR replayed
@@ -281,15 +282,14 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 		if _, err := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); err != nil {
 			abortStaleRebase(src, lg)
 			lg.Printf("files: pull: %v (continuing with local state)", err)
+		} else {
+			pulled = true
 		}
 	}
-	// The version gate sits between the pull and everything else: the
-	// pull is what delivers another machine's version bump, and a build
-	// that turns out to be stale must neither push nor apply anything.
-	if err := gate(); err != nil {
-		return err
-	}
-	if err := recordVersion(cfg, lg); err != nil {
+	// The marker pass sits between the pull and everything else: the pull
+	// is what delivers another machine's version bump, and a build that
+	// turns out to be stale must neither push nor apply anything.
+	if err := syncMarker(cfg, lg, pulled); err != nil {
 		return err
 	}
 	if hasOrigin {
@@ -331,7 +331,7 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	editable, deleted := partitionExisting(localEdits)
 	if len(editable) > 0 {
 		lg.Printf("files: capturing local edits: %v", editable)
-		if err := ReAddPush(cfg, lg, editable); err != nil {
+		if err := reAddPush(cfg, lg, editable); err != nil {
 			return err
 		}
 		var still, skipped2 []string
@@ -411,7 +411,8 @@ func ensureConfigManaged(cfg *config.Config, lg *log.Logger) error {
 // ReAddPush captures local edits to managed files back into the sync repo
 // and pushes. Template-sourced files are skipped by chezmoi itself
 // (re-add never overwrites templates), and the caller surfaces which paths
-// were dropped.
+// were dropped. The gated entry point for the daemon's file watcher;
+// Reconcile uses the ungated reAddPush, having gated its pass already.
 func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return nil
@@ -419,6 +420,10 @@ func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if err := gate(); err != nil {
 		return err
 	}
+	return reAddPush(cfg, lg, paths)
+}
+
+func reAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	args := append([]string{"re-add"}, paths...)
 	if out, err := chezmoi(args...); err != nil {
 		return err
@@ -565,6 +570,14 @@ func commitPush(cfg *config.Config, subject, body string, lg *log.Logger) error 
 		// on conflict), abort any half-done rebase, else leave it for the
 		// next pass.
 		if _, perr := gitutil.Run(src, "pull", "--rebase", "-X", "theirs", "--quiet"); perr == nil {
+			// That pull may have delivered a version bump: restore it if
+			// the rebase kept a stale marker, and never push as a build
+			// that just turned out to be outdated — the local commit
+			// waits for the post-update pass instead.
+			repairMarker(lg)
+			if gerr := gate(); gerr != nil {
+				return gerr
+			}
 			if _, err2 := gitutil.Run(src, "push", "--quiet"); err2 == nil {
 				announce(cfg, lg)
 				return nil

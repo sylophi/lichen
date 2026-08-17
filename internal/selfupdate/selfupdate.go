@@ -94,13 +94,16 @@ func download(tag, path string) (int64, error) {
 }
 
 // Install downloads tag's binary for this platform and renames it over
-// the running executable.
+// the running executable. The temp name carries the pid: the daemon and
+// a CLI command can both be updating (neither holds the sync lock here),
+// and two writers on one temp file would corrupt the binary; distinct
+// temp files make the last atomic rename win instead.
 func Install(tag string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	tmp := self + ".update"
+	tmp := fmt.Sprintf("%s.update.%d", self, os.Getpid())
 	n, err := download(tag, tmp)
 	if err != nil {
 		os.Remove(tmp)
@@ -138,13 +141,14 @@ func Required(repoV string) (string, error) {
 }
 
 // ExecSelf replaces this process with the binary at its own path —
-// after an Install, that is the new build — preserving arguments.
-// extraEnv entries are appended to the environment. Returns only on
-// failure.
-func ExecSelf(extraEnv ...string) error {
+// after an Install, that is the new build — preserving arguments and
+// environment (callers os.Setenv anything the new process must inherit,
+// which keeps repeated execs from stacking duplicate entries). Returns
+// only on failure.
+func ExecSelf() error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	return syscall.Exec(self, os.Args, append(os.Environ(), extraEnv...))
+	return syscall.Exec(self, os.Args, os.Environ())
 }
