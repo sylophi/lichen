@@ -469,26 +469,69 @@ func restoreConfig(lg *log.Logger) {
 	}
 }
 
-// ensureConfigManaged self-heals the keystone invariant: lichen's config
-// must be part of the sync repo. Covers first-machine bootstrap and the
-// config being forgotten later. Checked every pass: `chezmoi source-path
-// <target>` is one cheap call that fails iff the target is unmanaged.
+// ensureConfigManaged self-heals the keystone invariant: lichen's own
+// config files must be part of the sync repo. Covers first-machine
+// bootstrap and the config being forgotten later. Checked every pass:
+// one batched `chezmoi source-path` succeeds iff every file is managed,
+// and only on failure does the per-file walk find the stragglers.
 func ensureConfigManaged(cfg *config.Config, lg *log.Logger) error {
-	cfgPath, err := config.Path()
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(cfgPath); err != nil {
+	paths, _ := partitionExisting(config.OwnedPaths())
+	if len(paths) == 0 {
 		return nil
 	}
-	if isManaged(cfgPath) {
+	if _, err := chezmoi(append([]string{"source-path"}, paths...)...); err == nil {
 		return nil
 	}
-	lg.Printf("files: adding %s to the sync repo", cfgPath)
-	if _, err := chezmoi("add", cfgPath); err != nil {
+	var added []string
+	var errs []error
+	for _, p := range paths {
+		if isManaged(p) {
+			continue
+		}
+		lg.Printf("files: adding %s to the sync repo", p)
+		if _, err := chezmoi("add", p); err != nil {
+			// Keep going: one stubborn file must not leave the others
+			// unmanaged, or an earlier add uncommitted.
+			errs = append(errs, err)
+			continue
+		}
+		added = append(added, filepath.Base(p))
+	}
+	if len(added) > 0 {
+		if err := commitPush(cfg, "manage "+strings.Join(added, ", "), "", lg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// CaptureConfig captures an edit lichen just made to ONE of its own
+// config files into the sync repo and pushes it as one commit under the
+// caller's subject: skill sources live in skills.json, so this is what
+// carries a `lichen skills` change to the other machines. Only the named
+// file is touched: sweeping in the other owned configs could publish a
+// stale or half-applied copy of a file the caller never edited, under a
+// subject that hides it. A file not yet managed is added rather than
+// re-added (the first `skills add` creates skills.json). Without a sync
+// repo the change simply stays local.
+func CaptureConfig(cfg *config.Config, subject, path string, lg *log.Logger) error {
+	if !Active() {
+		return nil
+	}
+	if err := gate(); err != nil {
 		return err
 	}
-	return commitPush(cfg, "manage config.json", "", lg)
+	if _, err := os.Lstat(path); err != nil {
+		return err
+	}
+	verb := "re-add"
+	if !isManaged(path) {
+		verb = "add"
+	}
+	if _, err := chezmoi(verb, path); err != nil {
+		return err
+	}
+	return commitPush(cfg, subject, "", lg)
 }
 
 // reAddPush captures local edits to managed files back into the sync repo

@@ -1,6 +1,7 @@
-// lichen keeps the files on your dev machines in sync: dotfiles, agent
-// skills, slash commands, anything under your home directory. One daemon
-// per machine, edits propagate within seconds via ntfy.
+// lichen keeps your dev machines in sync, one module per kind of thing:
+// files (dotfiles, slash commands, anything under your home directory)
+// and agent skills installed from public repos. One daemon per machine,
+// edits propagate within seconds via ntfy, skill repos are polled.
 package main
 
 import (
@@ -23,8 +24,10 @@ import (
 	"lichen/internal/events"
 	"lichen/internal/files"
 	"lichen/internal/gitutil"
+	"lichen/internal/module"
 	"lichen/internal/proclock"
 	"lichen/internal/selfupdate"
+	"lichen/internal/skills"
 	"lichen/internal/version"
 )
 
@@ -45,6 +48,8 @@ func main() {
 		err = withLock(func() error { return cmdRecover(args[1:]) })
 	case "list", "ls":
 		err = cmdList()
+	case "skills":
+		err = cmdSkills(args[1:])
 	case "logs":
 		err = cmdLogs()
 	case "daemon":
@@ -115,6 +120,13 @@ func usage() {
   lichen recover <path...>         bring back files deleted everywhere
   lichen list                      show every synced file
 
+  lichen skills add <repo> [--skill <name>]...
+                                   sync agent skills from a public repo
+  lichen skills remove <repo|skill...>
+                                   stop syncing skills (uninstalls them)
+  lichen skills list               show every synced skill
+  lichen skills update             check skill repos for updates now
+
   lichen status [--secrets]        daemon health and webhook setup
                                     (--secrets reveals the topic URL)
   lichen logs                      tail the daemon log
@@ -166,8 +178,8 @@ func paint(code, s string) string {
 func bold(s string) string { return paint("1", s) }
 func dim(s string) string  { return paint("2", s) }
 
-// cmdSync with paths starts managing them. With none it runs a full pass:
-// pull, capture local edits, apply.
+// cmdSync with paths starts managing them. With none it runs a full pass
+// over every module: pull, capture local edits, apply, refresh skills.
 func cmdSync(paths []string) error {
 	lg := clilog()
 	cfg, err := files.LoadConfig(lg)
@@ -175,7 +187,7 @@ func cmdSync(paths []string) error {
 		return err
 	}
 	if len(paths) == 0 {
-		if err := files.Reconcile(cfg, lg); err != nil {
+		if err := module.ReconcileAll(cfg, lg); err != nil {
 			return err
 		}
 		lg.Printf("ok")
@@ -219,6 +231,171 @@ func cmdList() error {
 	}
 	for _, p := range managed {
 		fmt.Println(config.ContractHome(p))
+	}
+	return nil
+}
+
+func cmdSkills(args []string) error {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "add":
+		return withLock(func() error { return cmdSkillsAdd(args[1:]) })
+	case "remove", "rm":
+		return withLock(func() error { return cmdSkillsRemove(args[1:]) })
+	case "update":
+		return withLock(func() error { return cmdSkillsUpdate() })
+	case "list", "ls":
+		return cmdSkillsList()
+	}
+	return fmt.Errorf("usage: lichen skills <add|remove|list|update>")
+}
+
+// skillsChange is the shared tail of the mutating skills subcommands:
+// pull the freshest shared state, apply a skills-config edit on top of
+// it, make the installed skills match, and publish the change to the
+// other machines. force bypasses the poll throttle, for edits that need
+// fresh upstream state.
+func skillsChange(force bool, edit func() (subject string, err error)) error {
+	lg := clilog()
+	cfg, err := files.LoadConfig(lg)
+	if err != nil {
+		return err
+	}
+	// Pull before editing: skills.json is shared state, and an edit on a
+	// stale copy would push the staleness (commitPush resolves conflicts
+	// in favor of the local commit, silently reverting another machine's
+	// change). Offline just means the edit bases on the freshest state
+	// this machine can get. An outdated build stops HERE, before it
+	// writes anything, and updateAndRerun replays the command.
+	if err := files.Reconcile(cfg, lg); err != nil {
+		var outdated *files.OutdatedError
+		if errors.As(err, &outdated) {
+			return err
+		}
+		lg.Printf("files: %v (continuing with local state)", err)
+	}
+	subject, err := edit()
+	if err != nil {
+		return err
+	}
+	refresh := skills.Reconcile
+	if force {
+		refresh = skills.Update
+	}
+	if err := refresh(lg); err != nil {
+		return err
+	}
+	skillsPath, err := config.SkillsPath()
+	if err != nil {
+		return err
+	}
+	if err := files.CaptureConfig(cfg, subject, skillsPath, lg); err != nil {
+		lg.Printf("config not pushed (%v), other machines catch up on a later pass", err)
+	}
+	return nil
+}
+
+func cmdSkillsAdd(args []string) error {
+	var repo string
+	var only []string
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--skill":
+			if i++; i >= len(args) {
+				return fmt.Errorf("--skill needs a name")
+			}
+			only = append(only, args[i])
+		case strings.HasPrefix(args[i], "-"):
+			return fmt.Errorf("unknown flag %q", args[i])
+		case repo != "":
+			return fmt.Errorf("one repo at a time (got %q and %q)", repo, args[i])
+		default:
+			repo = args[i]
+		}
+	}
+	if repo == "" {
+		return fmt.Errorf("usage: lichen skills add <owner/repo> [--skill <name>]...")
+	}
+	// force: adding is the moment upstream freshness is user-visible
+	// (--skill names are validated against the repo's current state).
+	var key string
+	err := skillsChange(true, func() (string, error) {
+		var err error
+		key, err = skills.AddSource(repo, only)
+		return "skills: add " + key, err
+	})
+	if err != nil {
+		return err
+	}
+	installed, err := skills.Installed()
+	if err != nil {
+		return err
+	}
+	var mine []string
+	for _, s := range installed {
+		if s.Repo == key {
+			mine = append(mine, s.Name)
+		}
+	}
+	if len(mine) == 0 {
+		fmt.Printf("no skills installed from %s (see messages above)\n", key)
+		return nil
+	}
+	fmt.Printf("syncing %d skill(s) from %s: %s\n", len(mine), key, strings.Join(mine, ", "))
+	return nil
+}
+
+func cmdSkillsRemove(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lichen skills remove <repo|skill...>")
+	}
+	// No force: removal needs no upstream contact at all.
+	err := skillsChange(false, func() (string, error) {
+		return "skills: remove " + strings.Join(args, " "), skills.RemoveSources(args)
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("stopped syncing: %s\n", strings.Join(args, ", "))
+	return nil
+}
+
+func cmdSkillsUpdate() error {
+	if err := skills.Update(clilog()); err != nil {
+		return err
+	}
+	fmt.Println("ok")
+	return nil
+}
+
+func cmdSkillsList() error {
+	installed, err := skills.Installed()
+	if err != nil {
+		return err
+	}
+	configured := skills.ConfiguredKeys()
+	if len(installed) == 0 && len(configured) == 0 {
+		fmt.Println("no skills synced (lichen skills add <owner/repo>)")
+		return nil
+	}
+	width := 0
+	for _, s := range installed {
+		width = max(width, len(s.Name))
+	}
+	fromRepo := map[string]bool{}
+	for _, s := range installed {
+		fromRepo[s.Repo] = true
+		fmt.Printf("%-*s  %s\n", width, s.Name, dim(s.Repo))
+	}
+	// A source with nothing installed yet: a fresh machine before its
+	// first pass, or a repo that failed to clone.
+	for _, key := range configured {
+		if !fromRepo[key] {
+			fmt.Printf("%s\n", dim(key+" (nothing installed yet, see: lichen logs)"))
+		}
 	}
 	return nil
 }
@@ -273,6 +450,12 @@ func cmdStatus(showSecrets bool) error {
 		fmt.Printf("\n%s sync repo %s\n", bold(fmt.Sprintf("files (%d synced):", len(managed))), originNote)
 	} else {
 		fmt.Printf("\n%s %s\n", bold("files:"), paint("33", "not initialized (run install.sh with LICHEN_REPO=<git url>)"))
+	}
+
+	if installed, err := skills.Installed(); err == nil {
+		if repos := skills.ConfiguredKeys(); len(repos) > 0 || len(installed) > 0 {
+			fmt.Printf("\n%s %s\n", bold(fmt.Sprintf("skills (%d installed):", len(installed))), strings.Join(repos, ", "))
+		}
 	}
 
 	// The webhook is optional: lichen already nudges the other machines
