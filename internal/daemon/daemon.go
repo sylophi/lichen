@@ -153,23 +153,33 @@ func Run() error {
 	return nil
 }
 
+// updateBackoff spaces out failed auto-update attempts: the release
+// download is the biggest I/O the daemon ever does and it runs holding
+// both the mutex and the cross-process lock, so an event burst must not
+// repeat it back-to-back. The hourly pass is the natural retry.
+const updateBackoff = 10 * time.Minute
+
+// lastUpdateAttempt is only touched under runLocked's mutex. A
+// successful attempt never records itself: the process is replaced.
+var lastUpdateAttempt time.Time
+
 // autoUpdate installs the release the sync repo requires and execs it in
 // place of this process: launchd sees the same PID, so KeepAlive's
 // restart throttle never enters the picture. On failure the daemon stays
-// up with syncing paused, and the next pass (event or hourly) retries.
+// up with syncing paused until a later pass gets through.
 func autoUpdate(lg *log.Logger, repoV string) {
-	tag, err := selfupdate.Required(repoV)
-	if err != nil {
-		lg.Printf("update: %v (syncing stays paused, retrying on the next pass)", err)
+	if since := time.Since(lastUpdateAttempt); since < updateBackoff {
+		lg.Printf("update: last attempt failed %s ago, backing off", since.Round(time.Second))
 		return
 	}
-	self, err := os.Executable()
+	lastUpdateAttempt = time.Now()
+	tag, err := selfupdate.Required(repoV)
 	if err != nil {
-		lg.Printf("update: %v", err)
+		lg.Printf("update: %v (syncing stays paused, retrying on a later pass)", err)
 		return
 	}
 	lg.Printf("update: installed %s, restarting the daemon on it", tag)
-	if err := syscall.Exec(self, os.Args, os.Environ()); err != nil {
+	if err := selfupdate.ExecSelf(); err != nil {
 		lg.Printf("update: exec: %v", err)
 	}
 }

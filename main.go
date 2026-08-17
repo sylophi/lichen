@@ -88,17 +88,19 @@ func updateAndRerun(outdated *files.OutdatedError) error {
 		return err
 	}
 	fmt.Printf("updated %s -> %s\n", outdated.Build, tag)
+	restartDaemonIfLoaded()
+	fmt.Println("rerunning the command on the new build...")
+	return selfupdate.ExecSelf("LICHEN_AUTOUPDATED=1")
+}
+
+// restartDaemonIfLoaded bounces the launchd agent so it picks up a
+// freshly installed binary. Best-effort: no daemon, no problem.
+func restartDaemonIfLoaded() {
 	if daemonLoaded() {
 		if err := launchctlRun("kickstart", "-k", daemonTarget()); err == nil {
 			fmt.Println("daemon restarted on the new build")
 		}
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	fmt.Println("rerunning the command on the new build...")
-	return syscall.Exec(self, os.Args, append(os.Environ(), "LICHEN_AUTOUPDATED=1"))
 }
 
 func usage() {
@@ -377,11 +379,11 @@ func cmdUpdate() error {
 	fmt.Println("checking the latest release...")
 	tag, err := selfupdate.LatestTag()
 	if err != nil {
-		return fmt.Errorf("fetching release info: %w", err)
+		return err
 	}
 	// <= keeps a deleted release from quietly downgrading this machine
 	// below what the sync repo's version gate requires.
-	if version.Valid(tag) && version.Compare(tag, version.Current) <= 0 {
+	if version.Compare(tag, version.Current) <= 0 {
 		fmt.Println("already at the latest release: " + version.Current)
 		return nil
 	}
@@ -390,11 +392,7 @@ func cmdUpdate() error {
 		return err
 	}
 	fmt.Printf("updated %s -> %s\n", version.Current, tag)
-	if daemonLoaded() {
-		if err := launchctlRun("kickstart", "-k", daemonTarget()); err == nil {
-			fmt.Println("daemon restarted on the new build")
-		}
-	}
+	restartDaemonIfLoaded()
 	return nil
 }
 

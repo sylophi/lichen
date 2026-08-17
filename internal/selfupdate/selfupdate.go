@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"syscall"
 	"time"
 
 	"lichen/internal/version"
@@ -39,21 +40,23 @@ func httpGet(url, accept string, timeout time.Duration) (*http.Response, error) 
 	return resp, nil
 }
 
-// LatestTag returns the tag_name of the latest GitHub release.
+// LatestTag returns the tag of the latest GitHub release, guaranteed
+// version.Valid: the release workflow only tags vX.Y.Z, so anything else
+// is an error here, and callers can Compare without re-checking.
 func LatestTag() (string, error) {
 	resp, err := httpGet("https://api.github.com/repos/"+releaseRepo+"/releases/latest", "application/vnd.github+json", 10*time.Second)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetching release info: %w", err)
 	}
 	defer resp.Body.Close()
 	var data struct {
 		TagName string `json:"tag_name"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return "", err
+		return "", fmt.Errorf("fetching release info: %w", err)
 	}
-	if data.TagName == "" {
-		return "", fmt.Errorf("release metadata has no tag_name")
+	if !version.Valid(data.TagName) {
+		return "", fmt.Errorf("latest release tag %q is not vX.Y.Z", data.TagName)
 	}
 	return data.TagName, nil
 }
@@ -123,13 +126,25 @@ func Install(tag string) error {
 func Required(repoV string) (string, error) {
 	tag, err := LatestTag()
 	if err != nil {
-		return "", fmt.Errorf("fetching release info: %w", err)
+		return "", err
 	}
-	if !version.Valid(tag) || version.Compare(tag, repoV) < 0 {
+	if version.Compare(tag, repoV) < 0 {
 		return "", fmt.Errorf("the sync repo requires %s but the latest release is %s: publish a newer release, or lower %s in the sync repo", repoV, tag, version.Marker)
 	}
 	if err := Install(tag); err != nil {
 		return "", err
 	}
 	return tag, nil
+}
+
+// ExecSelf replaces this process with the binary at its own path —
+// after an Install, that is the new build — preserving arguments.
+// extraEnv entries are appended to the environment. Returns only on
+// failure.
+func ExecSelf(extraEnv ...string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(self, os.Args, append(os.Environ(), extraEnv...))
 }

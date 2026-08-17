@@ -286,7 +286,10 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	// The version gate sits between the pull and everything else: the
 	// pull is what delivers another machine's version bump, and a build
 	// that turns out to be stale must neither push nor apply anything.
-	if err := gate(cfg, lg); err != nil {
+	if err := gate(); err != nil {
+		return err
+	}
+	if err := recordVersion(cfg, lg); err != nil {
 		return err
 	}
 	if hasOrigin {
@@ -413,7 +416,7 @@ func ReAddPush(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return nil
 	}
-	if err := gate(cfg, lg); err != nil {
+	if err := gate(); err != nil {
 		return err
 	}
 	args := append([]string{"re-add"}, paths...)
@@ -436,7 +439,7 @@ func Sync(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized (re-run install.sh with LICHEN_REPO=<git url>)")
 	}
-	if err := gate(cfg, lg); err != nil {
+	if err := gate(); err != nil {
 		return err
 	}
 	for _, p := range paths {
@@ -474,7 +477,7 @@ func Remove(cfg *config.Config, lg *log.Logger, paths []string) error {
 	if !Active() {
 		return fmt.Errorf("no sync repo initialized")
 	}
-	if err := gate(cfg, lg); err != nil {
+	if err := gate(); err != nil {
 		return err
 	}
 	if _, err := chezmoi(append([]string{"forget", "--force"}, paths...)...); err != nil {

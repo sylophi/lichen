@@ -24,7 +24,7 @@ const Marker = ".lichen-version"
 // Dev builds do not, and sit outside version gating entirely.
 func IsRelease() bool { return Valid(Current) }
 
-var tagRE = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)$`)
+var tagRE = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
 
 // Valid reports whether s has the exact vX.Y.Z shape the release
 // workflow enforces on tags.
