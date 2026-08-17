@@ -398,7 +398,7 @@ func Reconcile(cfg *config.Config, lg *log.Logger) error {
 	if len(deleted) > 0 {
 		// A locally deleted synced file is deleted everywhere: the other
 		// machines move their copies to backups, and the content stays
-		// recoverable from the sync repo's history (`lichen recover`).
+		// recoverable from the sync repo's history (`lichen sync recover`).
 		// A failure only defers the deletion to the next pass, so it
 		// must not block the applies below.
 		slices.Sort(deleted)

@@ -37,7 +37,7 @@ destroyed). A file deleted by mistake can be brought back from the sync
 repo's git history, on all machines at once:
 
 ```sh
-lichen recover ~/.zshrc
+lichen sync recover ~/.zshrc
 ```
 
 ## Skills

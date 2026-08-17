@@ -43,11 +43,7 @@ func main() {
 	case "status":
 		err = cmdStatus(slices.Contains(args[1:], "--secrets"))
 	case "sync":
-		err = withLock(func() error { return cmdSync(args[1:]) })
-	case "recover":
-		err = withLock(func() error { return cmdRecover(args[1:]) })
-	case "list", "ls":
-		err = cmdList()
+		err = cmdSyncCmd(args[1:])
 	case "skills":
 		err = cmdSkills(args[1:])
 	case "logs":
@@ -117,8 +113,8 @@ func usage() {
 
   lichen sync <path...>            start syncing files across machines
   lichen sync                      pull and apply everything now
-  lichen recover <path...>         bring back files deleted everywhere
-  lichen list                      show every synced file
+  lichen sync recover <path...>    bring back files deleted everywhere
+  lichen sync list                 show every synced file
 
   lichen skills add <repo> [--skill <name>]...
                                    sync agent skills from a public repo
@@ -178,6 +174,24 @@ func paint(code, s string) string {
 func bold(s string) string { return paint("1", s) }
 func dim(s string) string  { return paint("2", s) }
 
+// cmdSyncCmd dispatches the files module's subcommands, mirroring the
+// skills module's shape. Anything else is treated as paths to start
+// syncing (a file literally named "recover" or "list" needs a ./ prefix
+// or absolute path).
+func cmdSyncCmd(args []string) error {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "recover":
+		return withLock(func() error { return cmdRecover(args[1:]) })
+	case "list", "ls":
+		return cmdList()
+	}
+	return withLock(func() error { return cmdSync(args) })
+}
+
 // cmdSync with paths starts managing them. With none it runs a full pass
 // over every module: pull, capture local edits, apply, refresh skills.
 func cmdSync(paths []string) error {
@@ -202,7 +216,7 @@ func cmdSync(paths []string) error {
 
 func cmdRecover(paths []string) error {
 	if len(paths) == 0 {
-		return fmt.Errorf("usage: lichen recover <path...>")
+		return fmt.Errorf("usage: lichen sync recover <path...>")
 	}
 	lg := clilog()
 	cfg, err := files.LoadConfig(lg)

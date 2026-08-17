@@ -11,7 +11,7 @@
 // it here once, so a path that merely FAILED to materialize (a foreign
 // file moved to backups, an apply that errored) is never bounced at the
 // fleet as a deletion. Content is never lost: the deleting machine's
-// copy survives in the sync repo's git history (`lichen recover` brings
+// copy survives in the sync repo's git history (`lichen sync recover` brings
 // it back), every other machine moves its copy into its backups dir.
 
 package files
@@ -275,7 +275,7 @@ func propagateDeletions(cfg *config.Config, lg *log.Logger, paths []string) (boo
 	if err := saveDeletionLog(src, dlog); err != nil {
 		return false, err
 	}
-	lg.Printf("files: deleted locally, deleting everywhere (`lichen recover` brings one back): %v", doomed)
+	lg.Printf("files: deleted locally, deleting everywhere (`lichen sync recover` brings one back): %v", doomed)
 	if _, err := chezmoi(append([]string{"forget", "--force"}, doomed...)...); err != nil {
 		return false, err
 	}
@@ -407,7 +407,7 @@ func deleteDeparted(src string, departed []string, lg *log.Logger) error {
 				lg.Printf("files: deleting %s: %v", v, err)
 				continue
 			}
-			lg.Printf("files: deleted %s (kept at %s, `lichen recover` re-syncs it)", v, to)
+			lg.Printf("files: deleted %s (kept at %s, `lichen sync recover` re-syncs it)", v, to)
 		}
 		if fi.IsDir() {
 			removeEmptyDirs(abs)
@@ -527,7 +527,7 @@ func Recover(cfg *config.Config, lg *log.Logger, paths []string) ([]string, erro
 		if !found {
 			for k := range dlog {
 				if atOrUnder(key, k) {
-					return nil, fmt.Errorf("%s was deleted as part of %s: run `lichen recover %s`", p, k, k)
+					return nil, fmt.Errorf("%s was deleted as part of %s: run `lichen sync recover %s`", p, k, k)
 				}
 			}
 			return nil, fmt.Errorf("%s has no recorded deletion (if it was ever synced, its history is still in the sync repo)", p)
